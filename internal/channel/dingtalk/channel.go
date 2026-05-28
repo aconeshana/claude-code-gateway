@@ -4,6 +4,7 @@ package dingtalk
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -170,6 +171,18 @@ func (c *Channel) onChatBotMessage(ctx context.Context, data *chatbot.BotCallbac
 	// In group chats, strip @bot mention.
 	if data.ConversationType == "2" {
 		text = stripAtMention(text)
+	}
+
+	// Handle picture messages: download image and forward as InputBlocks.
+	if data.Msgtype == "picture" {
+		c.handleImageMessage(ctx, data, userID, chatID, msgID, text)
+		return nil, nil
+	}
+
+	// Handle richText messages (image + text combo).
+	if data.Msgtype == "richText" {
+		c.handleRichTextMessage(ctx, data, userID, chatID, msgID, text)
+		return nil, nil
 	}
 
 	if text == "" {
@@ -448,6 +461,288 @@ func (c *Channel) doSendViaOpenAPI(ctx context.Context, chatID string, msgJSON s
 	return nil
 }
 
+// --- Image handling ---
+
+// handleImageMessage downloads the image via OpenAPI and forwards it as
+// InputBlocks (same format as Feishu: base64-encoded image block).
+func (c *Channel) handleImageMessage(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, chatID, msgID, caption string) {
+	downloadCode := extractDownloadCode(data.Content)
+	if downloadCode == "" {
+		log.Printf("[channel/dingtalk] picture message without downloadCode, msgID=%s", shortID(msgID))
+		if caption != "" {
+			c.dispatch(ctx, channel.InboundMessage{
+				ChannelKind: "dingtalk", UserID: userID, ChatID: chatID,
+				MessageID: msgID, Kind: channel.InputText, Text: caption,
+			})
+		}
+		return
+	}
+
+	imgData, err := c.downloadRobotFile(downloadCode)
+	if err != nil {
+		log.Printf("[channel/dingtalk] image download failed: %v", err)
+		c.dispatch(ctx, channel.InboundMessage{
+			ChannelKind: "dingtalk", UserID: userID, ChatID: chatID,
+			MessageID: msgID, Kind: channel.InputText, Text: "[图片下载失败] " + caption,
+		})
+		return
+	}
+
+	mediaType := detectMediaType(imgData)
+	b64 := base64.StdEncoding.EncodeToString(imgData)
+	block := map[string]interface{}{
+		"type": "image",
+		"source": map[string]interface{}{
+			"type":       "base64",
+			"media_type": mediaType,
+			"data":       b64,
+		},
+	}
+
+	var blocks []interface{}
+	blocks = append(blocks, block)
+	if caption != "" {
+		blocks = append([]interface{}{map[string]interface{}{"type": "text", "text": caption}}, blocks...)
+	}
+
+	log.Printf("[channel/dingtalk] image msg user=%s size=%d mediaType=%s", shortID(userID), len(imgData), mediaType)
+
+	c.dispatch(ctx, channel.InboundMessage{
+		ChannelKind: "dingtalk",
+		UserID:      userID,
+		ChatID:      chatID,
+		MessageID:   msgID,
+		Kind:        channel.InputBlocks,
+		Blocks:      blocks,
+	})
+}
+
+// handleRichTextMessage handles richText messages which may contain both
+// text and images. DingTalk richText Content is typically:
+//
+//	{"richText":[{"text":"..."},{"downloadCode":"xxx","type":"picture"}]}
+func (c *Channel) handleRichTextMessage(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, chatID, msgID, caption string) {
+	texts, downloadCodes := parseRichTextContent(data.Content)
+
+	// Combine any inline text with the caption from data.Text.Content
+	allText := caption
+	if len(texts) > 0 {
+		joined := strings.Join(texts, "\n")
+		if allText == "" {
+			allText = joined
+		} else if joined != allText {
+			allText = joined
+		}
+	}
+
+	// No images found — send as plain text.
+	if len(downloadCodes) == 0 {
+		if allText == "" {
+			allText = "[富文本消息]"
+		}
+		c.dispatch(ctx, channel.InboundMessage{
+			ChannelKind: "dingtalk", UserID: userID, ChatID: chatID,
+			MessageID: msgID, Kind: channel.InputText, Text: allText,
+		})
+		return
+	}
+
+	// Download images and build blocks.
+	var blocks []interface{}
+	if allText != "" {
+		blocks = append(blocks, map[string]interface{}{"type": "text", "text": allText})
+	}
+	for _, code := range downloadCodes {
+		imgData, err := c.downloadRobotFile(code)
+		if err != nil {
+			log.Printf("[channel/dingtalk] richText image download failed: %v", err)
+			continue
+		}
+		mediaType := detectMediaType(imgData)
+		b64 := base64.StdEncoding.EncodeToString(imgData)
+		blocks = append(blocks, map[string]interface{}{
+			"type": "image",
+			"source": map[string]interface{}{
+				"type":       "base64",
+				"media_type": mediaType,
+				"data":       b64,
+			},
+		})
+	}
+
+	if len(blocks) == 0 {
+		c.dispatch(ctx, channel.InboundMessage{
+			ChannelKind: "dingtalk", UserID: userID, ChatID: chatID,
+			MessageID: msgID, Kind: channel.InputText, Text: "[图片下载失败]",
+		})
+		return
+	}
+
+	log.Printf("[channel/dingtalk] richText msg user=%s texts=%d images=%d", shortID(userID), len(texts), len(downloadCodes))
+	c.dispatch(ctx, channel.InboundMessage{
+		ChannelKind: "dingtalk", UserID: userID, ChatID: chatID,
+		MessageID: msgID, Kind: channel.InputBlocks, Blocks: blocks,
+	})
+}
+
+// parseRichTextContent extracts text segments and image downloadCodes from
+// DingTalk richText content. The content structure is:
+//
+//	{"richText":[{"text":"..."},{"downloadCode":"xxx","type":"picture"}]}
+//
+// or sometimes the Content is already the array directly.
+func parseRichTextContent(content interface{}) (texts []string, downloadCodes []string) {
+	if content == nil {
+		return
+	}
+
+	var items []interface{}
+	switch v := content.(type) {
+	case map[string]interface{}:
+		if rt, ok := v["richText"].([]interface{}); ok {
+			items = rt
+		}
+	case []interface{}:
+		items = v
+	case string:
+		var m map[string]interface{}
+		if json.Unmarshal([]byte(v), &m) == nil {
+			if rt, ok := m["richText"].([]interface{}); ok {
+				items = rt
+			}
+		}
+	}
+
+	for _, item := range items {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if t, ok := m["text"].(string); ok && t != "" {
+			texts = append(texts, t)
+		}
+		if code, ok := m["downloadCode"].(string); ok && code != "" {
+			downloadCodes = append(downloadCodes, code)
+		}
+	}
+	return
+}
+// POST https://api.dingtalk.com/v1.0/robot/messageFiles/download
+// This API returns a JSON response with a downloadUrl field; we then GET that URL
+// to retrieve the actual file bytes.
+func (c *Channel) downloadRobotFile(downloadCode string) ([]byte, error) {
+	token, err := c.tokenMgr.GetToken()
+	if err != nil {
+		return nil, fmt.Errorf("get token: %w", err)
+	}
+
+	payload := map[string]string{
+		"downloadCode": downloadCode,
+		"robotCode":    c.cfg.AppKey,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, _ := http.NewRequest(http.MethodPost,
+		"https://api.dingtalk.com/v1.0/robot/messageFiles/download",
+		bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-acs-dingtalk-access-token", token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("status=%d body=%s", resp.StatusCode, string(respBody))
+	}
+
+	// If response Content-Type indicates image, return directly as bytes.
+	ct := resp.Header.Get("Content-Type")
+	if strings.HasPrefix(ct, "image/") {
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
+		if err != nil {
+			return nil, fmt.Errorf("read image: %w", err)
+		}
+		return data, nil
+	}
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 20*1024*1024))
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	// The API returns JSON like {"downloadUrl":"https://..."}.
+	var dlResp struct {
+		DownloadURL string `json:"downloadUrl"`
+	}
+	if err := json.Unmarshal(respBody, &dlResp); err != nil || dlResp.DownloadURL == "" {
+		// Fallback: if the response is not JSON, treat as raw file bytes.
+		if len(respBody) > 0 && respBody[0] != '{' && respBody[0] != '[' {
+			return respBody, nil
+		}
+		return nil, fmt.Errorf("no downloadUrl in response: %s", safeString(respBody, 200))
+	}
+
+	// Fetch the actual file from the download URL.
+	fileResp, err := http.Get(dlResp.DownloadURL)
+	if err != nil {
+		return nil, fmt.Errorf("download from url: %w", err)
+	}
+	defer fileResp.Body.Close()
+
+	if fileResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download url status=%d", fileResp.StatusCode)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(fileResp.Body, 20*1024*1024))
+	if err != nil {
+		return nil, fmt.Errorf("read file: %w", err)
+	}
+	return data, nil
+}
+
+// extractDownloadCode parses the downloadCode from the message Content field.
+// DingTalk picture messages have Content like: {"downloadCode":"xxx"} or a
+// string containing the downloadCode.
+func extractDownloadCode(content interface{}) string {
+	if content == nil {
+		return ""
+	}
+	switch v := content.(type) {
+	case map[string]interface{}:
+		if code, ok := v["downloadCode"].(string); ok {
+			return code
+		}
+	case string:
+		var m map[string]interface{}
+		if json.Unmarshal([]byte(v), &m) == nil {
+			if code, ok := m["downloadCode"].(string); ok {
+				return code
+			}
+		}
+	}
+	return ""
+}
+
+func detectMediaType(data []byte) string {
+	ct := http.DetectContentType(data)
+	switch {
+	case strings.HasPrefix(ct, "image/jpeg"):
+		return "image/jpeg"
+	case strings.HasPrefix(ct, "image/png"):
+		return "image/png"
+	case strings.HasPrefix(ct, "image/gif"):
+		return "image/gif"
+	case strings.HasPrefix(ct, "image/webp"):
+		return "image/webp"
+	default:
+		return "image/png"
+	}
+}
+
 // --- Helpers ---
 
 func (c *Channel) dispatch(ctx context.Context, m channel.InboundMessage) {
@@ -515,4 +810,11 @@ func mapEmoji(name string) string {
 	default:
 		return "OK_HAND"
 	}
+}
+
+func safeString(data []byte, n int) string {
+	if len(data) <= n {
+		return string(data)
+	}
+	return string(data[:n]) + "..."
 }
