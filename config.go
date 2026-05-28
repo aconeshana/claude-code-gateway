@@ -11,6 +11,7 @@ import (
 	"github.com/joho/godotenv"
 
 	"github.com/anthropics/claude-code-gateway/internal/bridge"
+	dingtalkCh "github.com/anthropics/claude-code-gateway/internal/channel/dingtalk"
 	feishuCh "github.com/anthropics/claude-code-gateway/internal/channel/feishu"
 )
 
@@ -31,6 +32,7 @@ type Config struct {
 	AuthToken           string            `json:"-"`
 	CLIEnv              map[string]string `json:"cli_env"`
 	Feishu              feishuCh.Config   `json:"feishu"`
+	DingTalk            dingtalkCh.Config `json:"dingtalk"`
 	SummaryInterval     int               `json:"summary_interval"`
 	AdminModel          string            `json:"admin_model"`
 	EnvFilePath         string            `json:"-"`
@@ -145,6 +147,23 @@ func LoadConfig(configPath string) (*Config, error) {
 			}
 		}
 		cfg.Feishu.AllowedUserIDs = ids
+	}
+
+	if v := os.Getenv("DINGTALK_APP_KEY"); v != "" {
+		cfg.DingTalk.AppKey = v
+	}
+	if v := os.Getenv("DINGTALK_APP_SECRET"); v != "" {
+		cfg.DingTalk.AppSecret = v
+	}
+	if v := os.Getenv("DINGTALK_ALLOWED_USER_IDS"); v != "" {
+		var ids []string
+		for _, id := range strings.Split(v, ",") {
+			id = strings.TrimSpace(id)
+			if id != "" {
+				ids = append(ids, id)
+			}
+		}
+		cfg.DingTalk.AllowedUserIDs = ids
 	}
 
 	if v := os.Getenv("GATEWAY_SHARE_EXTERNAL_SESSIONS"); v != "" {

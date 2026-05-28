@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/anthropics/claude-code-gateway/internal/bridge"
+	dingtalkCh "github.com/anthropics/claude-code-gateway/internal/channel/dingtalk"
 	feishuCh "github.com/anthropics/claude-code-gateway/internal/channel/feishu"
 	"github.com/anthropics/claude-code-gateway/internal/gateway"
 	"github.com/anthropics/claude-code-gateway/internal/runtime"
@@ -71,15 +72,20 @@ func cmdServe() {
 	defer stop()
 
 	var (
-		feiCh     *feishuCh.Channel
-		newBridge *bridge.Bridge
+		newBridge       *bridge.Bridge
+		channelShutdown func()
 	)
+
+	if cfg.Feishu.AppID != "" && cfg.DingTalk.AppKey != "" {
+		log.Fatalf("cannot enable both Feishu and DingTalk channels; configure only one")
+	}
+
 	if cfg.Feishu.AppID != "" {
 		statePath := defaultStatePath()
 		store := persist.NewJSONStore(statePath)
 		mgr.SetSummaryStore(store)
 
-		feiCh = feishuCh.New(feishuCh.Config{
+		feiCh := feishuCh.New(feishuCh.Config{
 			AppID:          cfg.Feishu.AppID,
 			AppSecret:      cfg.Feishu.AppSecret,
 			AllowedUserIDs: cfg.Feishu.AllowedUserIDs,
@@ -102,12 +108,48 @@ func cmdServe() {
 			ApplyCLIPath:        rt.SetCLIPath,
 		})
 		newBridge.Start(ctx)
+		channelShutdown = feiCh.Shutdown
 		go func() {
 			if err := feiCh.Start(ctx, newBridge); err != nil {
 				log.Printf("[channel/feishu] error: %v", err)
 			}
 		}()
 		log.Printf("  Feishu bridge: enabled (app_id=%s, state=%s)", cfg.Feishu.AppID, statePath)
+	} else if cfg.DingTalk.AppKey != "" {
+		statePath := defaultStatePath()
+		store := persist.NewJSONStore(statePath)
+		mgr.SetSummaryStore(store)
+
+		dtCh := dingtalkCh.New(dingtalkCh.Config{
+			AppKey:         cfg.DingTalk.AppKey,
+			AppSecret:      cfg.DingTalk.AppSecret,
+			AllowedUserIDs: cfg.DingTalk.AllowedUserIDs,
+		})
+		discoverer := claude.NewDiscoverer("", "")
+		newBridge = bridge.New(bridge.Options{
+			Manager:             mgr,
+			Channel:             dtCh,
+			DefaultCWD:          cfg.DefaultWorkingDir,
+			ProjectRoot:         cfg.ProjectRoot,
+			EnvFilePath:         cfg.EnvFilePath,
+			AdminModel:          cfg.AdminModel,
+			SummaryInterval:     cfg.SummaryInterval,
+			Persister:           store,
+			Discoverer:          discoverer,
+			ShareExternal:       cfg.ShareExternalSessions,
+			DiscoveryWindowDays: cfg.DiscoveryWindowDays,
+			RescanInterval:      cfg.DiscoveryRescanInterval,
+			ApplyAllowedUsers:   dtCh.SetAllowedUserIDs,
+			ApplyCLIPath:        rt.SetCLIPath,
+		})
+		newBridge.Start(ctx)
+		channelShutdown = dtCh.Shutdown
+		go func() {
+			if err := dtCh.Start(ctx, newBridge); err != nil {
+				log.Printf("[channel/dingtalk] error: %v", err)
+			}
+		}()
+		log.Printf("  DingTalk bridge: enabled (app_key=%s, state=%s)", cfg.DingTalk.AppKey, statePath)
 	}
 
 	go func() {
@@ -125,8 +167,8 @@ func cmdServe() {
 	if newBridge != nil {
 		newBridge.Shutdown()
 	}
-	if feiCh != nil {
-		feiCh.Shutdown()
+	if channelShutdown != nil {
+		channelShutdown()
 	}
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {

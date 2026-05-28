@@ -12,7 +12,8 @@ import (
 // and the gateway stores it in Session.ChannelKind. Add new constants when
 // adding a new channel implementation.
 const (
-	KindFeishu = "feishu"
+	KindFeishu   = "feishu"
+	KindDingTalk = "dingtalk"
 	// KindSlack = "slack"  — future
 	// KindWeb   = "web"    — test.html / WebSocket inspector
 )

@@ -11,6 +11,7 @@ require (
 )
 
 require (
+	github.com/open-dingtalk/dingtalk-stream-sdk-go v0.9.1 // indirect
 	golang.org/x/sys v0.29.0 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )

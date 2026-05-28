@@ -161,7 +161,7 @@ func (b *Bridge) cmdNew(ctx context.Context, m channel.InboundMessage, args stri
 		OwnerID:     m.UserID,
 		ChatID:      m.ChatID,
 		ChannelKind: m.ChannelKind,
-		Origin:      session.OriginFeishu,
+		Origin:      channelKindToOrigin(m.ChannelKind),
 	})
 	if err != nil {
 		b.sendText(ctx, m.ChatID, "创建 session 失败: "+err.Error())
@@ -455,8 +455,11 @@ func renderSessionHeader(info session.SessionInfo, focusedID string) string {
 	}
 	parts = append(parts, status)
 
-	if info.Origin == session.OriginFeishu {
-		parts = append(parts, "`[💬feishu created]`")
+	switch info.Origin {
+	case session.OriginFeishu:
+		parts = append(parts, "`[💬feishu]`")
+	case session.OriginDingTalk:
+		parts = append(parts, "`[💬dingtalk]`")
 	}
 
 	if t := parseRFC3339(info.LastActivity); !t.IsZero() {
