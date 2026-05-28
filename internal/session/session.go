@@ -105,6 +105,8 @@ const (
 	// OriginFeishu — created by the Feishu (Lark) channel via /new or by an
 	// auto-resolve when the user sent a plain message.
 	OriginFeishu = "feishu"
+	// OriginDingTalk — created by the DingTalk channel via /new or auto-resolve.
+	OriginDingTalk = "dingtalk"
 	// OriginWS — created via the WebSocket gateway transport.
 	OriginWS = "ws"
 	// OriginExternal — discovered on disk (~/.claude/projects/*.jsonl) but

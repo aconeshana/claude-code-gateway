@@ -145,6 +145,16 @@ github.com/larksuite/oapi-sdk-go/v3/ws
 # github.com/mdp/qrterminal/v3 v3.2.1
 ## explicit; go 1.20
 github.com/mdp/qrterminal/v3
+# github.com/open-dingtalk/dingtalk-stream-sdk-go v0.9.1
+## explicit; go 1.18
+github.com/open-dingtalk/dingtalk-stream-sdk-go/card
+github.com/open-dingtalk/dingtalk-stream-sdk-go/chatbot
+github.com/open-dingtalk/dingtalk-stream-sdk-go/client
+github.com/open-dingtalk/dingtalk-stream-sdk-go/handler
+github.com/open-dingtalk/dingtalk-stream-sdk-go/logger
+github.com/open-dingtalk/dingtalk-stream-sdk-go/payload
+github.com/open-dingtalk/dingtalk-stream-sdk-go/plugin
+github.com/open-dingtalk/dingtalk-stream-sdk-go/utils
 # golang.org/x/sys v0.29.0
 ## explicit; go 1.18
 golang.org/x/sys/plan9

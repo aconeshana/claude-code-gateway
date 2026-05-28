@@ -302,7 +302,7 @@ func (b *Bridge) resolveOrCreateSession(ctx context.Context, m channel.InboundMe
 		OwnerID:     m.UserID,
 		ChatID:      m.ChatID,
 		ChannelKind: m.ChannelKind,
-		Origin:      session.OriginFeishu,
+		Origin:      channelKindToOrigin(m.ChannelKind),
 	})
 	if err != nil {
 		b.sendText(ctx, m.ChatID, "自动创建 session 失败: "+err.Error())
@@ -398,4 +398,15 @@ func (b *Bridge) displayIDFromGatewayID(gatewayID string) string {
 
 func projectName(dir string) string {
 	return filepath.Base(dir)
+}
+
+func channelKindToOrigin(kind string) string {
+	switch kind {
+	case channel.KindFeishu:
+		return session.OriginFeishu
+	case channel.KindDingTalk:
+		return session.OriginDingTalk
+	default:
+		return kind
+	}
 }

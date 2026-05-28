@@ -274,7 +274,12 @@ func (m *Manager) ClaimExternal(sessionID, ownerID, chatID, channelKind string) 
 	}
 	sess.mu.Lock()
 	sess.OwnerID = ownerID
-	sess.Origin = OriginFeishu
+	switch channelKind {
+	case "dingtalk":
+		sess.Origin = OriginDingTalk
+	default:
+		sess.Origin = OriginFeishu
+	}
 	if chatID != "" {
 		sess.ChatID = chatID
 	}
