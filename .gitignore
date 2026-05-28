@@ -1,0 +1,23 @@
+# Binaries
+/ccg
+/gateway
+/claude-code-gateway
+*.exe
+
+# Runtime files
+*.pid
+.gateway.pid
+*.log
+gateway.log
+gateway_state.json
+feishu_state.json
+.gateway-discovery-cache.json
+
+# Credentials / secrets
+.env
+.env.*
+!.env.example
+
+# Development artifacts
+REVIEW.md
+test.html

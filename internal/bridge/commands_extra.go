@@ -1,0 +1,708 @@
+package bridge
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/anthropics/claude-code-gateway/internal/channel"
+	"github.com/anthropics/claude-code-gateway/internal/session"
+	"github.com/google/uuid"
+)
+
+// modelInfo enumerates the models exposed via /model.
+type modelInfo struct {
+	Name  string
+	Alias string
+	Desc  string
+}
+
+var availableModels = []modelInfo{
+	{"claude-sonnet-4-6", "sonnet", "Best coding model, fast"},
+	{"claude-opus-4-6", "opus", "Deepest reasoning"},
+	{"claude-haiku-4-5", "haiku", "Fastest, lightweight"},
+}
+
+// --- /model ---
+
+func (b *Bridge) cmdModel(ctx context.Context, m channel.InboundMessage, args string) {
+	modelName := strings.TrimSpace(args)
+	if modelName == "" {
+		var btns []channel.Button
+		for _, mi := range availableModels {
+			btns = append(btns, channel.Button{
+				Label:  mi.Name,
+				Style:  "default",
+				Action: map[string]string{"action": "switch_model", "model": mi.Name},
+			})
+		}
+		b.sendCard(ctx, m.ChatID, channel.Card{
+			Title:    "Switch Model",
+			Tone:     channel.ToneInfo,
+			Sections: []channel.Section{{Buttons: btns}},
+		})
+		return
+	}
+	focused, ok := b.mgr.FocusedSession(m.UserID)
+	if !ok {
+		b.sendText(ctx, m.ChatID, "没有 focused session,请先 /new 创建或 /list 选择")
+		return
+	}
+	// SwitchModel needs a running CLI process; if focused is idle (process
+	// exited cleanly between interactions) reactivate first — CLISessionID
+	// is set eagerly inside Reactivate so the subsequent SwitchModel
+	// doesn't race the CLI startup.
+	if focused.Info().Status != string(session.StatusActive) {
+		newSess, err := b.mgr.Reactivate(ctx, focused.ID)
+		if err != nil {
+			b.sendText(ctx, m.ChatID, "切换模型前需要先恢复 session,但恢复失败: "+err.Error())
+			return
+		}
+		b.ensureSubscribed(ctx, newSess, m)
+		b.saveStateIfPossible()
+		focused = newSess
+	}
+	if err := focused.SwitchModel(modelName); err != nil {
+		b.sendText(ctx, m.ChatID, "切换模型失败: "+err.Error())
+		return
+	}
+	b.sendText(ctx, m.ChatID, "模型已切换为 "+modelName)
+}
+
+// --- /diff ---
+
+const (
+	maxDiffLinesPerFile = 50
+	maxDiffTotalLen     = 12000
+	diffTimeout         = 10 * time.Second
+)
+
+type fileDiff struct {
+	Name    string
+	Added   int
+	Deleted int
+	Lines   []diffLine
+}
+
+type diffLine struct {
+	Type    byte
+	Content string
+}
+
+func (b *Bridge) cmdDiff(ctx context.Context, m channel.InboundMessage) {
+	wd := b.defaultCWD
+	if focused, ok := b.mgr.FocusedSession(m.UserID); ok {
+		if focused.WorkingDir != "" {
+			wd = focused.WorkingDir
+		}
+	}
+
+	diffCtx, cancel := context.WithTimeout(ctx, diffTimeout)
+	defer cancel()
+
+	stat := strings.TrimSpace(runGit(diffCtx, wd, "diff", "HEAD", "--shortstat"))
+	rawDiff := runGit(diffCtx, wd, "diff", "HEAD")
+	untracked := runGit(diffCtx, wd, "ls-files", "--others", "--exclude-standard")
+
+	fileDiffs := parseDiffByFile(rawDiff)
+	if untracked != "" {
+		for _, f := range strings.Split(strings.TrimSpace(untracked), "\n") {
+			f = strings.TrimSpace(f)
+			if f != "" {
+				fileDiffs = append(fileDiffs, fileDiff{Name: f, Lines: []diffLine{{Type: '+', Content: "(new untracked file)"}}})
+			}
+		}
+	}
+
+	if len(fileDiffs) == 0 && stat == "" {
+		b.sendCard(ctx, m.ChatID, channel.Card{
+			Title:    "Diff",
+			Tone:     channel.ToneNeutral,
+			Sections: []channel.Section{{Markdown: "No changes"}},
+		})
+		return
+	}
+
+	title := fmt.Sprintf("Diff: %d files", len(fileDiffs))
+	if stat != "" {
+		title = "Diff: " + stat
+	}
+
+	var sections []channel.Section
+	for i, f := range fileDiffs {
+		header := "**" + shortenFilePath(f.Name) + "**"
+		if f.Added > 0 || f.Deleted > 0 {
+			header += " · "
+			if f.Deleted > 0 {
+				header += fmt.Sprintf("<font color='red'>-%d</font> ", f.Deleted)
+			}
+			if f.Added > 0 {
+				header += fmt.Sprintf("<font color='green'>+%d</font>", f.Added)
+			}
+		}
+		sec := channel.Section{Markdown: header}
+		if len(f.Lines) > 0 {
+			sec.Markdown += "\n" + renderDiffLines(f.Lines)
+		}
+		sections = append(sections, sec)
+		if i < len(fileDiffs)-1 {
+			sections = append(sections, channel.Section{Divider: true})
+		}
+	}
+
+	b.sendCard(ctx, m.ChatID, channel.Card{
+		Title:    title,
+		Tone:     channel.ToneSuccess,
+		Sections: sections,
+	})
+}
+
+func runGit(ctx context.Context, dir string, args ...string) string {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	var out bytes.Buffer
+	cmd.Stdout = &limitedWriter{buf: &out, limit: 64 * 1024}
+	cmd.Stderr = io.Discard
+	_ = cmd.Run()
+	return out.String()
+}
+
+func parseDiffByFile(diff string) []fileDiff {
+	if strings.TrimSpace(diff) == "" {
+		return nil
+	}
+	var files []fileDiff
+	rawLines := strings.Split(diff, "\n")
+	var current *fileDiff
+	totalLen := 0
+	lineCount := 0
+
+	flush := func() {
+		if current == nil {
+			return
+		}
+		files = append(files, *current)
+		current = nil
+	}
+
+	for _, line := range rawLines {
+		if strings.HasPrefix(line, "diff --git") {
+			flush()
+			if totalLen > maxDiffTotalLen {
+				files = append(files, fileDiff{Name: "...", Lines: []diffLine{{Type: ' ', Content: "(truncated)"}}})
+				return files
+			}
+			parts := strings.Fields(line)
+			name := ""
+			if len(parts) >= 4 {
+				name = strings.TrimPrefix(parts[3], "b/")
+			}
+			current = &fileDiff{Name: name}
+			lineCount = 0
+			continue
+		}
+		if current == nil {
+			continue
+		}
+		if strings.HasPrefix(line, "index ") || strings.HasPrefix(line, "---") || strings.HasPrefix(line, "+++") {
+			continue
+		}
+		if lineCount >= maxDiffLinesPerFile {
+			if lineCount == maxDiffLinesPerFile {
+				current.Lines = append(current.Lines, diffLine{Type: ' ', Content: "... (truncated)"})
+				lineCount++
+			}
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "@@"):
+			current.Lines = append(current.Lines, diffLine{Type: '@', Content: line})
+		case strings.HasPrefix(line, "+"):
+			current.Lines = append(current.Lines, diffLine{Type: '+', Content: line[1:]})
+			current.Added++
+			totalLen += len(line)
+		case strings.HasPrefix(line, "-"):
+			current.Lines = append(current.Lines, diffLine{Type: '-', Content: line[1:]})
+			current.Deleted++
+			totalLen += len(line)
+		case line == "":
+			current.Lines = append(current.Lines, diffLine{Type: ' ', Content: ""})
+		default:
+			if len(line) > 0 && line[0] == ' ' {
+				current.Lines = append(current.Lines, diffLine{Type: ' ', Content: line[1:]})
+			} else {
+				current.Lines = append(current.Lines, diffLine{Type: ' ', Content: line})
+			}
+		}
+		lineCount++
+	}
+	flush()
+	return files
+}
+
+func renderDiffLines(lines []diffLine) string {
+	var parts []string
+	var buf []string
+	curType := byte(0)
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		switch curType {
+		case '-':
+			for _, line := range buf {
+				parts = append(parts, "<font color='red'>~~"+line+"~~</font>")
+			}
+		case '+':
+			parts = append(parts, "<font color='green'>"+strings.Join(buf, "\n")+"</font>")
+		default:
+			parts = append(parts, strings.Join(buf, "\n"))
+		}
+		buf = buf[:0]
+	}
+	for _, dl := range lines {
+		t := dl.Type
+		if t == '@' {
+			t = ' '
+		}
+		if t != curType {
+			flush()
+			curType = t
+		}
+		content := dl.Content
+		if dl.Type == '@' {
+			content = "<font color='grey'>" + escapeLarkMD(content) + "</font>"
+		} else {
+			content = escapeLarkMD(content)
+		}
+		buf = append(buf, content)
+	}
+	flush()
+	return strings.Join(parts, "\n")
+}
+
+func escapeLarkMD(s string) string {
+	return strings.ReplaceAll(s, "~", "\\~")
+}
+
+func shortenFilePath(p string) string {
+	parts := strings.Split(p, "/")
+	if len(parts) <= 3 {
+		return p
+	}
+	return ".../" + strings.Join(parts[len(parts)-2:], "/")
+}
+
+// --- /config ---
+
+func (b *Bridge) cmdConfig(ctx context.Context, m channel.InboundMessage, args string) {
+	args = strings.TrimSpace(args)
+	switch {
+	case args == "" || args == "show":
+		values := b.currentConfigValues()
+		b.sendCard(ctx, m.ChatID, buildConfigCard(values, b.envFilePath))
+	case strings.HasPrefix(args, "set "):
+		parts := strings.SplitN(strings.TrimPrefix(args, "set "), " ", 2)
+		if len(parts) < 2 {
+			b.sendText(ctx, m.ChatID, "用法: /config set <KEY> <VALUE>")
+			return
+		}
+		key := strings.ToUpper(strings.TrimSpace(parts[0]))
+		value := strings.TrimSpace(parts[1])
+		if key == "GATEWAY_PERMISSION_MODE" {
+			value = NormalizePermissionMode(value)
+		}
+		field, ok := FindConfigField(key)
+		if !ok {
+			b.sendText(ctx, m.ChatID, fmt.Sprintf("未知配置项: %s\n使用 /config 查看可用配置", key))
+			return
+		}
+		if b.envFilePath == "" {
+			b.sendText(ctx, m.ChatID, "未配置 .env 文件路径,无法保存")
+			return
+		}
+		if err := WriteEnvFile(b.envFilePath, map[string]string{key: value}); err != nil {
+			b.sendText(ctx, m.ChatID, "写入配置失败: "+err.Error())
+			return
+		}
+		if field.Mutable {
+			b.applyConfigChange(key, value)
+			b.sendText(ctx, m.ChatID, fmt.Sprintf("✅ %s 已更新为 `%s`(已生效)", field.Label, value))
+		} else {
+			b.sendText(ctx, m.ChatID, fmt.Sprintf("✅ %s 已写入 .env,重启后生效", field.Label))
+		}
+	default:
+		b.sendText(ctx, m.ChatID, "用法:\n/config — 查看当前配置\n/config set <KEY> <VALUE> — 修改配置")
+	}
+}
+
+func (b *Bridge) currentConfigValues() map[string]string {
+	values := make(map[string]string)
+	if b.envFilePath != "" {
+		if v, err := ParseEnvValues(b.envFilePath); err == nil {
+			for k, val := range v {
+				values[k] = val
+			}
+		}
+	}
+	if b.summaryInterval > 0 || values["SUMMARY_INTERVAL"] == "" {
+		values["SUMMARY_INTERVAL"] = strconv.Itoa(b.summaryInterval)
+	}
+	if b.admin != nil {
+		values["ADMIN_MODEL"] = b.admin.model
+	}
+	if b.projectRoot != "" {
+		values["GATEWAY_PROJECT_ROOT"] = b.projectRoot
+	}
+	return values
+}
+
+// applyConfigChange applies a Mutable change to the live bridge without
+// requiring a restart.
+func (b *Bridge) applyConfigChange(key, value string) {
+	switch key {
+	case "SUMMARY_INTERVAL":
+		if n, err := strconv.Atoi(value); err == nil {
+			b.mu.Lock()
+			b.summaryInterval = n
+			b.mu.Unlock()
+		}
+	case "ADMIN_MODEL":
+		if b.admin != nil {
+			b.admin.setModel(value)
+			b.admin.destroy()
+		}
+	case "GATEWAY_DEFAULT_CWD":
+		dir := expandHome(value)
+		b.mu.Lock()
+		b.defaultCWD = dir
+		b.mu.Unlock()
+		b.mgr.AddAllowedBaseDir(dir)
+		if b.admin != nil {
+			b.admin.setWorkingDir(dir)
+		}
+	case "GATEWAY_PROJECT_ROOT":
+		dir := expandHome(value)
+		b.mu.Lock()
+		b.projectRoot = dir
+		b.mu.Unlock()
+		b.mgr.AddAllowedBaseDir(dir)
+	case "GATEWAY_PERMISSION_MODE":
+		b.mgr.SetDefaultPermissionMode(NormalizePermissionMode(value))
+	case "GATEWAY_SHARE_EXTERNAL_SESSIONS":
+		b.mu.Lock()
+		b.shareExternal = parseConfigBool(value)
+		b.mu.Unlock()
+	case "GATEWAY_DISCOVERY_WINDOW_DAYS":
+		if n, err := strconv.Atoi(value); err == nil {
+			b.mu.Lock()
+			b.discoveryWindowDays = n
+			b.mu.Unlock()
+		}
+	case "GATEWAY_DISCOVERY_RESCAN_INTERVAL":
+		if d, err := time.ParseDuration(value); err == nil {
+			b.mu.Lock()
+			b.rescanInterval = d
+			b.mu.Unlock()
+		}
+	case "FEISHU_ALLOWED_USER_IDS":
+		if b.applyAllowedUsers != nil {
+			var ids []string
+			for _, id := range strings.Split(value, ",") {
+				id = strings.TrimSpace(id)
+				if id != "" {
+					ids = append(ids, id)
+				}
+			}
+			b.applyAllowedUsers(ids)
+		}
+	case "CLAUDE_CLI_PATH":
+		if b.applyCLIPath != nil && value != "" {
+			b.applyCLIPath(value)
+		}
+	}
+}
+
+// parseConfigBool mirrors the env-var bool parsing in config.go.
+func parseConfigBool(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "true", "yes", "on", "1":
+		return true
+	}
+	return false
+}
+
+func buildConfigCard(values map[string]string, envPath string) channel.Card {
+	var sections []channel.Section
+
+	sections = append(sections, channel.Section{Markdown: "**必填配置:**"})
+	for _, field := range ConfigFields {
+		if !field.Required {
+			continue
+		}
+		sections = append(sections, configFieldSection(field, values[field.EnvKey]))
+	}
+	sections = append(sections, channel.Section{Divider: true, Markdown: "**可选配置:**"})
+	for _, field := range ConfigFields {
+		if field.Required {
+			continue
+		}
+		sections = append(sections, configFieldSection(field, values[field.EnvKey]))
+	}
+	sections = append(sections, channel.Section{
+		Divider: true,
+		Note:    fmt.Sprintf("配置文件: %s | 也可用 /config set KEY VALUE", envPath),
+	})
+	return channel.Card{Title: "Gateway Config", Tone: channel.ToneInfo, Sections: sections}
+}
+
+func configFieldSection(field ConfigField, val string) channel.Section {
+	display := formatConfigValue(val, field)
+	if display == "(未设置)" && field.Default != "" {
+		display = field.Default + " (默认)"
+	}
+	tag := ""
+	if !field.Required {
+		if field.Mutable {
+			tag = " · <font color='green'>运行时可改</font>"
+		} else {
+			tag = " · <font color='grey'>需重启</font>"
+		}
+	}
+	status := "✅"
+	if val == "" && field.Required {
+		status = "⚠️"
+	}
+	header := fmt.Sprintf("%s **%s**%s\n`%s` = `%s`", status, field.Label, tag, field.EnvKey, display)
+	if !field.Required {
+		header = fmt.Sprintf("**%s**%s\n`%s` = `%s`", field.Label, tag, field.EnvKey, display)
+	}
+	style := "primary"
+	if !field.Required {
+		style = "default"
+	}
+	return channel.Section{
+		Markdown: header,
+		Buttons: []channel.Button{{
+			Label:  "修改",
+			Style:  style,
+			Action: map[string]string{"action": "edit_config", "key": field.EnvKey},
+		}},
+	}
+}
+
+func formatConfigValue(val string, field ConfigField) string {
+	if val == "" {
+		return "(未设置)"
+	}
+	if field.Sensitive {
+		if len(val) <= 4 {
+			return "****"
+		}
+		end := 4 + 12
+		if end > len(val) {
+			end = len(val)
+		}
+		return val[:4] + strings.Repeat("*", end-4)
+	}
+	return val
+}
+
+// --- !shell ---
+
+func (b *Bridge) handleShell(ctx context.Context, m channel.InboundMessage, cmdStr string) {
+	wd := b.defaultCWD
+	if focused, ok := b.mgr.FocusedSession(m.UserID); ok {
+		if focused.WorkingDir != "" {
+			wd = focused.WorkingDir
+		}
+	}
+
+	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(execCtx, "sh", "-c", cmdStr)
+	cmd.Dir = wd
+
+	var stdout bytes.Buffer
+	cmd.Stdout = &limitedWriter{buf: &stdout, limit: 64 * 1024}
+	cmd.Stderr = io.Discard
+
+	err := cmd.Run()
+	exitCode := 0
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		} else if execCtx.Err() == context.DeadlineExceeded {
+			exitCode = -1
+		}
+	}
+	var text strings.Builder
+	text.WriteString(fmt.Sprintf("$ %s\n", cmdStr))
+	if stdout.Len() > 0 {
+		text.WriteString(stdout.String())
+	}
+	if exitCode != 0 {
+		text.WriteString(fmt.Sprintf("\n(exit code: %d)", exitCode))
+	}
+	body := fmt.Sprintf("```\n%s\n```", strings.TrimSpace(text.String()))
+	b.sendCard(ctx, m.ChatID, channel.Card{
+		Title:    "Shell",
+		Tone:     channel.ToneNeutral,
+		Sections: []channel.Section{{Markdown: body}},
+	})
+}
+
+// --- /setup ---
+
+func (b *Bridge) handleSetup(ctx context.Context, m channel.InboundMessage, content string) {
+	if b.admin == nil || b.envFilePath == "" {
+		b.sendCard(ctx, m.ChatID, channel.Card{
+			Title:    "Welcome",
+			Tone:     channel.ToneWarning,
+			Sections: []channel.Section{{Markdown: "请先设置 GATEWAY_DEFAULT_CWD 环境变量后重启。"}},
+		})
+		return
+	}
+	configs, err := b.parseConfigFromNL(ctx, content)
+	if err != nil || len(configs) == 0 {
+		b.sendCard(ctx, m.ChatID, channel.Card{
+			Title: "Welcome",
+			Tone:  channel.ToneWarning,
+			Sections: []channel.Section{{
+				Markdown: "请配置工作目录,例如:\n「工作目录 /Users/me/projects 项目根目录也是这个」",
+			}},
+		})
+		return
+	}
+	if err := WriteEnvFile(b.envFilePath, configs); err != nil {
+		b.sendText(ctx, m.ChatID, "写入配置失败: "+err.Error())
+		return
+	}
+	var lines []string
+	needRestart := false
+	for key, val := range configs {
+		field, _ := FindConfigField(key)
+		if field.Mutable {
+			b.applyConfigChange(key, val)
+		} else if key != "GATEWAY_DEFAULT_CWD" && key != "GATEWAY_PROJECT_ROOT" {
+			needRestart = true
+		}
+		if key == "GATEWAY_DEFAULT_CWD" || key == "GATEWAY_PROJECT_ROOT" {
+			b.applyConfigChange(key, val)
+		}
+		lines = append(lines, fmt.Sprintf("- **%s** = `%s`", field.Label, val))
+	}
+	msg := "**配置已保存:**\n" + strings.Join(lines, "\n")
+	if needRestart {
+		msg += "\n\n部分配置需重启后生效。"
+	}
+	msg += "\n\n现在可以直接发消息开始对话了。"
+	b.sendCard(ctx, m.ChatID, channel.Card{
+		Title:    "Config Saved",
+		Tone:     channel.ToneSuccess,
+		Sections: []channel.Section{{Markdown: msg}},
+	})
+}
+
+// --- /rename ---
+
+// cmdRename sets a custom display title on the focused session and forwards
+// the same command to the CLI so its internal session name stays in sync.
+func (b *Bridge) cmdRename(ctx context.Context, m channel.InboundMessage, args string) {
+	title := strings.TrimSpace(args)
+	if title == "" {
+		b.sendText(ctx, m.ChatID, "用法: /rename <新名字>")
+		return
+	}
+
+	sess, ok := b.mgr.FocusedSession(m.UserID)
+	if !ok {
+		b.sendText(ctx, m.ChatID, "没有 active session")
+		return
+	}
+
+	if err := b.mgr.SetCustomTitle(sess.ID, title); err != nil {
+		b.sendText(ctx, m.ChatID, "重命名失败: "+err.Error())
+		return
+	}
+	b.saveStateIfPossible()
+	b.sendText(ctx, m.ChatID, fmt.Sprintf("已重命名为 **%s**", title))
+}
+
+// limitedWriter caps how many bytes are written to its buffer.
+type limitedWriter struct {
+	buf   *bytes.Buffer
+	limit int
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	remaining := w.limit - w.buf.Len()
+	if remaining <= 0 {
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		p = p[:remaining]
+	}
+	return w.buf.Write(p)
+}
+
+func (b *Bridge) cmdBranch(ctx context.Context, m channel.InboundMessage, args string) {
+	name := strings.TrimSpace(args)
+
+	focused, ok := b.mgr.FocusedSession(m.UserID)
+	if !ok {
+		b.sendText(ctx, m.ChatID, "没有 active session")
+		return
+	}
+
+	info := focused.Info()
+	if info.CLISessionID == "" {
+		b.sendText(ctx, m.ChatID, "当前 session 没有 CLI session ID，无法 branch")
+		return
+	}
+
+	// Pre-assign a UUID so the CLI uses it as its session ID (--session-id flag).
+	// This lets us stamp CLISessionID immediately rather than waiting for KindInit.
+	forkCLISessionID := uuid.New().String()
+
+	branchSess, err := b.mgr.Create(ctx, session.CreateOpts{
+		OwnerID:     m.UserID,
+		WorkingDir:  info.WorkingDir,
+		ResumeID:    info.CLISessionID,
+		ForkSession: "1",
+		SessionID:   forkCLISessionID,
+		Origin:      session.OriginFeishu,
+		Label:       name,
+		ChatID:      m.ChatID,
+		ChannelKind: m.ChannelKind,
+	})
+	if err != nil {
+		b.sendText(ctx, m.ChatID, "创建 branch 失败: "+err.Error())
+		return
+	}
+
+	// Stamp the known CLI session ID immediately so /list shows it right away.
+	_ = b.mgr.SetCLISessionID(branchSess.ID, forkCLISessionID)
+
+	if err := b.mgr.SetFocus(m.UserID, branchSess.ID); err != nil {
+		b.sendText(ctx, m.ChatID, fmt.Sprintf("Branch 已创建 (%s) 但切换失败: %s", shortID(forkCLISessionID), err.Error()))
+		return
+	}
+
+	b.ensureSubscribed(ctx, branchSess, m)
+	b.saveStateIfPossible()
+
+	msg := fmt.Sprintf("已创建 branch session: `%s`", shortID(forkCLISessionID))
+	if name != "" {
+		msg += fmt.Sprintf(" (%s)", name)
+	}
+	msg += fmt.Sprintf("\n原 session: `%s`", displayIDFromInfo(info))
+	b.sendText(ctx, m.ChatID, msg)
+}

@@ -1,0 +1,108 @@
+package bridge
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/anthropics/claude-code-gateway/internal/channel"
+	"github.com/anthropics/claude-code-gateway/internal/plan"
+)
+
+// planIndex lazy-initialized on first /plan-list invocation. Plans dir
+// rarely changes between calls; we don't cache the file list because
+// disk-scan is cheap.
+func (b *Bridge) planIndex() *plan.Index {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.plans == nil {
+		b.plans = plan.NewIndex("")
+	}
+	return b.plans
+}
+
+// cmdPlanList shows recent plan files from ~/.claude/plans/. Most-recent
+// first. Each entry exposes a "查看" button that drills into the full
+// markdown via the show_plan card action.
+//
+// To create a new plan, the user runs `/plan` (which is forwarded to
+// Claude CLI verbatim and triggers plan mode there). /plan-list is only
+// for browsing/reviewing what's already on disk.
+func (b *Bridge) cmdPlanList(ctx context.Context, m channel.InboundMessage) {
+	plans, err := b.planIndex().List()
+	if err != nil {
+		b.sendText(ctx, m.ChatID, "读取 plan 目录失败: "+err.Error())
+		return
+	}
+	if len(plans) == 0 {
+		b.sendCard(ctx, m.ChatID, channel.Card{
+			Title:    "Plans",
+			Tone:     channel.ToneInfo,
+			Sections: []channel.Section{{Markdown: "暂无 plan。用 `/plan <description>` 进入 plan mode 让 Claude 生成第一份。"}},
+		})
+		return
+	}
+	sections := make([]channel.Section, 0, len(plans)+1)
+	for _, p := range plans {
+		title := p.Title
+		if title == "" {
+			title = "(untitled)"
+		}
+		body := fmt.Sprintf("**%s**\n%s · %s",
+			title, humanAgo(time.Since(p.MTime)), humanSize(p.Size))
+		sections = append(sections, channel.Section{
+			Markdown: body,
+			Buttons: []channel.Button{{
+				Label: "查看", Style: "primary",
+				Action: map[string]string{"action": "show_plan", "filename": p.Filename},
+			}},
+		})
+	}
+	sections = append(sections, channel.Section{
+		Divider: true,
+		Note:    fmt.Sprintf("Plans 目录: %s · 共 %d 份", b.planIndex().Dir(), len(plans)),
+	})
+	b.sendCard(ctx, m.ChatID, channel.Card{
+		Title:    "Plans · 按最近修改",
+		Tone:     channel.ToneInfo,
+		Sections: sections,
+	})
+}
+
+// showPlanDetail renders one plan's full markdown body. Feishu cards
+// accept several KB of markdown without complaint (the client folds long
+// sections in the UI), so we send the whole file. If we ever hit a hard
+// size limit, see ~/weflow/docs/lark-file-send-research.md for the file
+// upload path.
+func (b *Bridge) showPlanDetail(ctx context.Context, m channel.InboundMessage, filename string) {
+	p, err := b.planIndex().Get(filename)
+	if err != nil {
+		b.sendText(ctx, m.ChatID, "读取 plan 失败: "+err.Error())
+		return
+	}
+	header := fmt.Sprintf("**%s**\n_%s · %s · %s_",
+		p.Title,
+		p.Filename,
+		humanAgo(time.Since(p.MTime)),
+		humanSize(p.Size),
+	)
+	b.sendCard(ctx, m.ChatID, channel.Card{
+		Title: "Plan",
+		Tone:  channel.ToneNeutral,
+		Sections: []channel.Section{
+			{Markdown: header},
+			{Divider: true, Markdown: p.Body},
+		},
+	})
+}
+
+func humanSize(n int64) string {
+	switch {
+	case n < 1024:
+		return fmt.Sprintf("%d B", n)
+	case n < 1024*1024:
+		return fmt.Sprintf("%.1f KB", float64(n)/1024)
+	default:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1024*1024))
+	}
+}
