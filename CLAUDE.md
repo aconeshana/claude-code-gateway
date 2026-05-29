@@ -167,11 +167,39 @@ internal/
 
 `auto` 是 `auto_allow` 的简写。任何接收用户输入的入口(env var、`/config set`、`save_config` 按钮)都必须调 `bridge.NormalizePermissionMode(v)` 归一化再存。runtime 层只识别 canonical 值 `auto_allow` / `forward` / `default`。
 
-### Workspace 路径
+### Project 模型
 
-`/new <subdir>` 解析规则:若 `GATEWAY_PROJECT_ROOT/<subdir>` 是目录,自动用作 workingDir 并把 `<subdir>` 当 label。`/new /abs/path` 直接当路径。`/new label /some/dir` 显式 label + dir。
+**项目 = working directory**。一个项目可以有 N 个 session(各自独立的 CLI 历史)。项目集合在内存里聚合,不持久化项目本身(有 session 的 dir 自然"活着")。
 
-新工作目录必须是 `GATEWAY_DEFAULT_CWD` 或 `GATEWAY_PROJECT_ROOT`(由 `AddAllowedBaseDir` 注册)的子目录,否则 `mgr.Create` 返回错误。
+`b.projectsForUser(userID)` 来源:
+- `mgr.ListDiscoverableByOwner(userID, shareExternal)` 返回的 owned + 可选 external session 的 WorkingDir
+- `mgr.ListArchivedByOwner(userID)` 的归档 session WorkingDir
+- `b.manualProjects[userID]` — 用户通过 `[➕ 添加项目]` + 目录选择器手动加的 path(transient 内存集合,不持久化)
+
+一二级菜单算法**必须用同一份数据源**,否则 count 不一致(`countSessionsInProject` 跟 `buildProjectCard` 走同一条 filter pipeline)。
+
+### PickDir card flow(目录选择器)
+
+通用目录浏览组件(纯 Card + Button,任何 channel 都能渲染)。card action 链:
+
+```
+pick_dir (path, purpose, sort=name|mtime) → handlePickDir
+  ├─ ls path,每个子目录一个 [📂 name] 按钮
+  ├─ nav: [← 上级] [🏠 家目录] [按时间/名称 排序] [✓ 选这里]
+  └─ pickDirReturnButton(purpose) — 按 purpose 决定"返回"按钮的目标 action
+       add_project → [← 返回项目] (回 show_projects → buildProjectsCard)
+
+pick_dir_confirm (path, purpose) → handlePickDirConfirm
+  switch purpose:
+    add_project → addManualProject + 重渲项目卡
+    setup_cwd   → WriteEnvFile GATEWAY_DEFAULT_CWD + applyConfigChange
+```
+
+加新入口只需 (a) 触发处给按钮设 `purpose=xxx`、(b) 在 `pickDirReturnButton` 加返回 case、(c) 在 `handlePickDirConfirm` 加 purpose 分支。picker 本身不用改。
+
+### Workspace 路径(简化)
+
+`GATEWAY_DEFAULT_CWD` 是主聊天 plain text 兜底 dir(用户没选项目直接发字时新建 session 用)。默认 `~`,不强制 setup。`/new` 不再用 `GATEWAY_PROJECT_ROOT` 解析子目录 — 项目通过 `/project` 显式选,跨级目录由 PickDir flow 自由组合。
 
 ## Configuration
 
@@ -179,8 +207,7 @@ internal/
 |---------|-----|------|
 | `CLAUDE_CLI_PATH` | `claude` | CLI 二进制路径 |
 | `GATEWAY_LISTEN_ADDR` | `:8080` | WS 监听地址 |
-| `GATEWAY_DEFAULT_CWD` | `.` | 默认工作目录(也是基础允许目录) |
-| `GATEWAY_PROJECT_ROOT` | (空) | 项目基准目录(`/new <子目录>` 解析基准) |
+| `GATEWAY_DEFAULT_CWD` | `~` | 主聊天 plain text 自动建 session 时的兜底 dir(可热改) |
 | `GATEWAY_PERMISSION_MODE` | `auto` | `auto`(= `auto_allow`)/ `forward` |
 | `GATEWAY_MAX_SESSIONS` | `10` | 最大并发 session 数 |
 | `GATEWAY_AUTH_TOKEN` | (空) | WS Bearer Token |
@@ -281,18 +308,25 @@ internal/
 
 | 命令 | 说明 |
 |------|------|
-| `/new [label] [dir]` | 创建 session,设为 focused。单 arg 是 label 时,若 `projectRoot/label` 是目录则自动用作 workingDir |
-| `/list` | 活跃 + 归档列表(按状态显示「切换」/「恢复」按钮,归档收在二级菜单) |
-| `/switch [prefix]` | 无参=显示菜单(同 /list);带 prefix=智能切换(active→SetFocus,idle/archived→Reactivate) |
-| `/resume [prefix]` | `/switch` 的别名,意图是从 idle/归档恢复,行为完全一致 |
+| `/new` | 创建 session(V2 无参数)。**无 focus** → 弹 `/project` 卡;**有 focus** → 在 focus 所在项目下建新 session,自动开 thread |
+| `/project` (alias `/projects`) | 项目管理: 列已知项目 + `[进入][新建 session]`,底部 `[➕ 添加项目]` 进目录选择器 |
+| `/list` | 活跃 + 归档列表(按项目分组,二级菜单展开;每行有「切换/恢复/归档/刷新摘要/重命名」) |
+| `/switch [prefix]` | 切换主聊天 focus。**旧 focus 自动收纳到 thread**(无 thread → sendCard + openThread;已绑 → ping 原 thread),新 focus 提到主聊天 |
+| `/resume [prefix]` | 恢复 idle/archived/external session。走 `afterCreateOrActivate`:无 prior focus → 当焦点;有 prior focus → 开 thread + 还原 focus |
+| `/branch [name]` (alias `/fork`) | 在当前对话历史上 fork 一个 session,**永远开 thread**(不抢 focus) |
 | `/archive [prefix]` | 归档 session(active 会先关 runtime,然后保留记录) |
+| `/rename <name>` | 重命名 focused session 的 CustomTitle(也可在 /list 卡里点 `[重命名]` 走 card form) |
 | `/model [name]` | 列出可用模型或切换当前 session 的模型 |
 | `/diff` | 工作目录 git diff |
 | `/config` | 查看/修改配置,`/config set <KEY> <VAL>` 直接改 |
-| `/plan [desc]` | 进入 plan 模式(透传给 Claude CLI) |
+| `/plan [desc]` | 进入 plan 模式(透传给 Claude CLI);ExitPlanMode 时 bot 弹卡显示 plan 内容 + `[批准/拒绝]` |
+| `/plan-list` | 浏览 `~/.claude/plans` 目录;thread 里点 `[查看]` 详情卡回到原 thread(payload 编 thread_id) |
+| `/stop [prefix]` | 打断当前 turn(等价 CLI ESC) |
+| `/terminate [prefix]` | 停 CLI 子进程,session 变 idle(下次发消息自动 reactivate) |
+| `/status` | gateway 状态: discovery / summary worker / sessions / focused 项目 + 项目数 |
 | `/help` | 显示帮助(从 `b.commands` registry 自动生成) |
 | `!<cmd>` | 在 focused session 的 working_dir 执行 shell(30s 超时) |
-| 普通消息 | 发到 focused session;无 session 时自动创建/恢复 |
+| 普通消息 | 主聊天 → focused session;thread 里 → 该 thread 绑定的 session;无 focus → 自动创建/恢复 |
 | 其他 `/xxx` | 透传给 Claude CLI(/commit、/compact 等) |
 
 ### Session 生命周期
@@ -335,6 +369,75 @@ internal/
 **修改 admin marker 的流程**:bump `AdminSessionMarker` 到 `v2`(`summary_worker.go`)+ 同步更新 `adminPromptFingerprints` 第一项(`runtime/claude/discoverer.go`)。新 marker 立刻保护新 admin session,旧 v1 marker 的历史 session 仍能被 legacy 检测识别。
 
 **`_skip_meta_` 处理**:admin 判定某 session 是 meta-like(空对话 / 跑其他 session 的 worker 任务等)时输出此 sentinel,worker 记录空 summary + 当前 PromptVersion 当"已处理"标记 — UI 渲染 fallback "(短对话,无摘要)",不重试。
+
+### Thread 路由(Thread = Session)
+
+利用飞书原生"话题"(thread)做并行 session 的物理隔离 — 用户不再需要反复 `/switch`。
+
+**核心模型 — 主聊天 focus 稳定 + 自动开 thread**:
+
+| 用户行为 | bot 行为 |
+|----------|----------|
+| 首次 `/new`(没有 active focus) | 创建 sess,设为主聊天 focus,**不开 thread** |
+| `/new` 已经有 focus | 创建 sess,**自动开 thread**(reply_in_thread),focus 不变 |
+| `/resume <prefix>` 没有 active focus | 恢复 sess,设为主聊天 focus |
+| `/resume <prefix>` 已经有 focus | 恢复 sess,自动开 thread,focus 不变 |
+| `/branch <name>` | 永远开 thread(必然已有焦点)。focus 仍是父 session |
+| `/switch <prefix>` | 旧 focus 收纳到话题(若无 thread)→ 设新 focus |
+| 主聊天 plain text | 路由到 focused session(任何 session,包括 thread-bound) |
+| 话题里 plain text | 通过 thread_id 路由到绑定的 session |
+| 话题里 `/new` `/switch` `/branch` | **拒绝**(响应"请回主聊天") |
+| 任何位置 `/list` `/status` `/config` `/diff` 等 | 响应在原位置(thread 内自洽) |
+
+**关键约束**:
+- focus 概念稳定 — 主聊天的"上下文"由 focus 表达,且只通过显式 `/switch` 改变
+- 一个 session 可以**同时**是 focus(主聊天)+ 绑某个 thread,两个入口都活
+- 钉钉 channel 不实现 `channel.ThreadOpener`,降级到主聊天(无 thread 路径)
+- **thread inbound 不抢主聊天 focus**: `resolveOrCreateSession` thread 分支用 `snapshotFocus + restoreFocus` 包住 Reactivate/Create 调用 (mgr 内部 SetFocus 副作用会被还原)
+
+**LastInbound — 出站跟随入站位置**:
+`session.Session` 持有 transient 字段 `lastInbound{ChatID,ThreadID,RootMessageID}`,在 handleText/handleBlocks 入口由 `sess.SetLastInbound(...)` 设置。出站 helper 链路:
+- `replyText / replyCard(m, ...)` — inbound 触发的回复,按 m.ThreadID 决定 anchor
+- `sendTextForSession / sendCardForSession(sess, ...)` — streamSession 用,**优先用 sess.LastInbound**(用户最后一次发消息的位置),fallback 到 sess.RootMessageID
+- 效果: thread-bound session 在主聊天被发了消息,bot 输出在主聊天;反之亦然
+
+**Switch 收纳的两条路径**(`switchFocusTo` in `commands.go`):
+- 旧 focus **没绑 thread** → sendCard 主聊天发"📦 Session 收纳"卡 + `openThreadForSession` 开新 thread + `SetLastInbound(thread)` 让 in-flight 输出转向
+- 旧 focus **已绑 thread** → 不重开(避免重复话题入口卡),`SetLastInbound(thread)` + 在原 thread reply 一条"📌 主聊天 focus 已切走"(原入口卡显示新回复指示)
+
+**Card payload 用 CLI session id**(`sessionPayloadID`):
+mgr.Reactivate 会换掉 gateway-internal session.ID。卡上的 button payload 用 CLI session id(stable across reactivate),handler 用 `b.resolveSessionByPayload(id)` 双查兜底(先 `mgr.Get`,再 `mgr.GetByCLISessionID`),拿到 sess 后用 `sess.ID` 调 manager API。
+
+**MessageCount(`/list` 显示 `· N 条`)**:
+- 来源 1: Discoverer.parseSession 用 `countUserTurns` 流式数 `"type":"user"` 行(admin internal 跳过省 I/O)
+- 来源 2: 实时自增 — `sess.SendMessage / SendMessageBlocks` 内部 `s.MessageCount++`
+- 来源 3: Lazy 回填 — `filterAliveSessions` 渲染 /list 前对 alive 但 count=0 的 session 跑一次 `countUserTurnsInJSONL`,写回 `sess.SetMessageCount(n)`。一次性开销 ~50ms/文件,有缓存后近 0
+
+**Ghost session 处理**:
+`filterAliveSessions` 检查 `claudeRT.SessionJSONLPath(...)` 是否存在,缺失的(典型 `/branch` fork 没对话过)从 /list 视图过滤掉。`resolveOrCreateSession` step 2 (ResolveResumable) 撞到 ghost 时调 `mgr.Archive` 自动清,避免无限循环。
+
+**ThreadOpener capability**(`channel/channel.go`):
+- 可选接口,bot 通过 type assertion 检测:`if opener, ok := ch.(channel.ThreadOpener); ok`
+- 飞书实现 `OpenThread(ctx, anchorMsgID, OutboundMessage) → (msgID, threadID, err)`
+- 内部用 Lark Reply API + `reply_in_thread=true`
+
+**bridge helper**(`internal/bridge/bridge.go`):
+- `snapshotFocus(ownerID)` — 在 mgr.Create / Reactivate **之前**捕获,因为 mgr 内部 SetFocus 会覆盖
+- `afterCreateOrActivate(ctx, newSess, ownerID, anchorMsgID, welcome, priorFocus, forceThread)` — 统一规则:无 priorFocus 当 focus,有 priorFocus 还原 + 新 sess 进 thread
+- `openThreadForSession(ctx, sess, anchorMsgID, welcome)` — 调 ThreadOpener + BindThread
+- `replyText / replyCard(ctx, m, ...)` — inbound 触发的回复(命令、错误提示等),自动从 `m.ThreadID` 决定是否进 thread
+- `sendTextForSession / sendCardForSession(ctx, sess, chatID, ...)` — session 流式输出(`renderer.go`),从 `sess.RootMessageID` 取 anchor
+
+**数据模型**:
+- `session.Session` 加 `ThreadID, RootMessageID string`,持久化到 `gateway_state.json.users[].sessions[].thread_id / root_message_id`
+- `channel.InboundMessage` 加 `ThreadID, RootID, ParentID`(飞书 SDK 已暴露 `larkim.EventMessage.{ThreadId,RootId,ParentId}`)
+- `channel.OutboundMessage` 加 `ReplyToMessageID, OpenThread`:非空时 feishu channel 调 Reply API,钉钉忽略
+
+**错误恢复**:thread root 被删 → Reply API 返回 230020/230002/230001(`feishu.ErrReplyAnchorMissing`)→ `handleOutboundError` 清空 `session.ThreadID` + 通知用户"话题已失效,已切回主聊天" + 重试 Create 到主聊天。
+
+**新增命令处理函数务必用 `replyXxx` 而非 `sendXxx`**,否则在 thread 里发命令时响应会飞到主聊天,造成断裂。所有"焦点切换性"命令(`/new` `/resume` `/branch`)都应调 `snapshotFocus` + `afterCreateOrActivate`,不能直接 SetFocus。
+
+**所有 session-related 文案务必带 displayId(短 8 字符 hash)**,用户在主聊天看到话题入口卡片时能立刻识别"这是哪个 session"。
 
 ## CLI Subprocess
 

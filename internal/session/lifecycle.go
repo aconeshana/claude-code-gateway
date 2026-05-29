@@ -102,6 +102,59 @@ func (m *Manager) SetCustomTitle(sessionID, title string) error {
 	return nil
 }
 
+// GetByThreadID returns the (first) session bound to the given Lark thread.
+// Used by the bridge to route inbound thread messages to their session.
+// Returns ok=false when no session is bound to that thread.
+func (m *Manager) GetByThreadID(threadID string) (*Session, bool) {
+	if threadID == "" {
+		return nil, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, sess := range m.sessions {
+		if sess == nil {
+			continue
+		}
+		sess.mu.Lock()
+		match := sess.ThreadID == threadID
+		sess.mu.Unlock()
+		if match {
+			return sess, true
+		}
+	}
+	return nil, false
+}
+
+// BindThread binds a Lark thread to the session. rootMessageID is the thread
+// root that future bot replies will anchor at. Idempotent — re-binding the
+// same values is a no-op. Returns an error if the session does not exist.
+func (m *Manager) BindThread(sessionID, threadID, rootMessageID string) error {
+	sess, ok := m.Get(sessionID)
+	if !ok {
+		return fmt.Errorf("session %s not found", sessionID)
+	}
+	sess.mu.Lock()
+	sess.ThreadID = threadID
+	sess.RootMessageID = rootMessageID
+	sess.mu.Unlock()
+	return nil
+}
+
+// ClearThread removes the thread binding from a session. Used by the bridge
+// when a Reply API call fails with anchor-missing (user deleted the thread
+// root), so the next bot message falls back to the main chat.
+func (m *Manager) ClearThread(sessionID string) error {
+	sess, ok := m.Get(sessionID)
+	if !ok {
+		return fmt.Errorf("session %s not found", sessionID)
+	}
+	sess.mu.Lock()
+	sess.ThreadID = ""
+	sess.RootMessageID = ""
+	sess.mu.Unlock()
+	return nil
+}
+
 // SetCLISessionID eagerly stamps the CLI-assigned session ID on a gateway session.
 // Used by /branch after pre-assigning a UUID via --session-id so the display
 // is correct before the first KindInit event arrives.
@@ -297,9 +350,9 @@ func (m *Manager) ResolveResumable(ownerID string) *Session {
 	// External sessions (no owner, Origin=external) must NEVER be auto-resumed:
 	// they belong to a terminal/SDK user and silently hijacking them would be
 	// surprising. Admin sessions (Origin=admin) are gateway plumbing — also
-	// never resumable on the user path. Per-user index already filters these
-	// out since OwnerID="" doesn't appear in any user view; the Origin check
-	// is belt-and-suspenders.
+	// never resumable on the user path. Thread-bound sessions ARE resumable
+	// here (a session can be focused in main chat AND bound to a thread; the
+	// thread is just an additional UI entry point, not an exclusive owner).
 	isResumable := func(s *Session) bool {
 		return s != nil && s.Origin != OriginExternal && s.Origin != OriginAdmin
 	}
@@ -497,6 +550,8 @@ func (m *Manager) Reactivate(ctx context.Context, sessionID string) (*Session, e
 	channelKind := old.ChannelKind
 	ownerID := old.OwnerID
 	cliID := old.CLISessionID
+	threadID := old.ThreadID
+	rootMessageID := old.RootMessageID
 	old.mu.Unlock()
 
 	req := runtime.SpawnRequest{
@@ -519,6 +574,13 @@ func (m *Manager) Reactivate(ctx context.Context, sessionID string) (*Session, e
 	sess.Origin = origin
 	sess.ChatID = chatID
 	sess.ChannelKind = channelKind
+	// Carry over the Lark thread binding so the reactivated session keeps
+	// answering in the same thread. Without this, thread plain text would
+	// stop routing here after a single reactivate (GetByThreadID would miss)
+	// and main-chat /resume would gratuitously open a new thread instead of
+	// pinging the existing one.
+	sess.ThreadID = threadID
+	sess.RootMessageID = rootMessageID
 	// CLISessionID is normally populated when the runtime emits its init
 	// message, but for resume we already know it (it's what we passed to
 	// --resume). Set it eagerly so operations that need it — SwitchModel,
@@ -598,6 +660,9 @@ type ImportOpts struct {
 	WorkingDir        string
 	ChatID            string
 	ChannelKind       string
+	ThreadID          string
+	RootMessageID     string
+	MessageCount      int
 	CreatedAt         time.Time
 	ArchivedAt        time.Time
 	LastActivity      time.Time
@@ -644,6 +709,15 @@ func (m *Manager) importSession(opts ImportOpts, status Status) (string, error) 
 			if opts.ChannelKind != "" {
 				sess.ChannelKind = opts.ChannelKind
 			}
+			if opts.ThreadID != "" {
+				sess.ThreadID = opts.ThreadID
+			}
+			if opts.RootMessageID != "" {
+				sess.RootMessageID = opts.RootMessageID
+			}
+			if opts.MessageCount > 0 {
+				sess.MessageCount = opts.MessageCount
+			}
 			sess.Status = status
 			if !opts.ArchivedAt.IsZero() {
 				sess.ArchivedAt = opts.ArchivedAt
@@ -665,6 +739,9 @@ func (m *Manager) importSession(opts ImportOpts, status Status) (string, error) 
 		WorkingDir:        opts.WorkingDir,
 		ChatID:            opts.ChatID,
 		ChannelKind:       opts.ChannelKind,
+		ThreadID:          opts.ThreadID,
+		RootMessageID:     opts.RootMessageID,
+		MessageCount:      opts.MessageCount,
 		Status:            status,
 		CreatedAt:         coalesceTime(opts.CreatedAt),
 		ArchivedAt:        opts.ArchivedAt,

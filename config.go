@@ -19,7 +19,6 @@ type Config struct {
 	ListenAddr          string            `json:"listen_addr"`
 	CLIPath             string            `json:"cli_path"`
 	DefaultWorkingDir   string            `json:"default_working_dir"`
-	ProjectRoot         string            `json:"project_root"`
 	PermissionMode      string            `json:"permission_mode"`
 	MaxSessions         int               `json:"max_sessions"`
 	SessionIdleTimeout  time.Duration     `json:"session_idle_timeout"`
@@ -47,7 +46,7 @@ func DefaultConfig() *Config {
 	return &Config{
 		ListenAddr:              ":8080",
 		CLIPath:                 "claude",
-		DefaultWorkingDir:       ".",
+		DefaultWorkingDir:       expandHomePath("~"),
 		PermissionMode:          "auto",
 		MaxSessions:             10,
 		SessionIdleTimeout:      30 * time.Minute,
@@ -89,9 +88,6 @@ func LoadConfig(configPath string) (*Config, error) {
 	}
 	if v := os.Getenv("GATEWAY_DEFAULT_CWD"); v != "" {
 		cfg.DefaultWorkingDir = expandHomePath(v)
-	}
-	if v := os.Getenv("GATEWAY_PROJECT_ROOT"); v != "" {
-		cfg.ProjectRoot = expandHomePath(v)
 	}
 	if v := os.Getenv("GATEWAY_PERMISSION_MODE"); v != "" {
 		cfg.PermissionMode = v

@@ -21,7 +21,8 @@ import (
 //	InitialSummary, SourceRef)
 //
 // v2: added IsAdminInternal
-const cacheSchemaVersion = 2
+// v3: expanded adminPromptFingerprints (legacy admin worker prompts)
+const cacheSchemaVersion = 3
 
 type cachePayload struct {
 	Version int                    `json:"version"`

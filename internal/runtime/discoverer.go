@@ -65,4 +65,9 @@ type DiscoveredSession struct {
 	// consumers should skip them so they don't pollute /list or burn
 	// summary API quota.
 	IsAdminInternal bool
+
+	// MessageCount is the number of user-authored turns (excluding meta /
+	// queue events) extracted from the transcript. 0 means "unknown" —
+	// runtimes that can't compute it cheaply may leave it as zero.
+	MessageCount int
 }

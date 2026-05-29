@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -41,7 +42,7 @@ func (b *Bridge) cmdModel(ctx context.Context, m channel.InboundMessage, args st
 				Action: map[string]string{"action": "switch_model", "model": mi.Name},
 			})
 		}
-		b.sendCard(ctx, m.ChatID, channel.Card{
+		b.replyCard(ctx, m, channel.Card{
 			Title:    "Switch Model",
 			Tone:     channel.ToneInfo,
 			Sections: []channel.Section{{Buttons: btns}},
@@ -50,7 +51,7 @@ func (b *Bridge) cmdModel(ctx context.Context, m channel.InboundMessage, args st
 	}
 	focused, ok := b.mgr.FocusedSession(m.UserID)
 	if !ok {
-		b.sendText(ctx, m.ChatID, "没有 focused session,请先 /new 创建或 /list 选择")
+		b.replyText(ctx, m, "没有 focused session,请先 /new 创建或 /list 选择")
 		return
 	}
 	// SwitchModel needs a running CLI process; if focused is idle (process
@@ -60,7 +61,7 @@ func (b *Bridge) cmdModel(ctx context.Context, m channel.InboundMessage, args st
 	if focused.Info().Status != string(session.StatusActive) {
 		newSess, err := b.mgr.Reactivate(ctx, focused.ID)
 		if err != nil {
-			b.sendText(ctx, m.ChatID, "切换模型前需要先恢复 session,但恢复失败: "+err.Error())
+			b.replyText(ctx, m, "切换模型前需要先恢复 session,但恢复失败: "+err.Error())
 			return
 		}
 		b.ensureSubscribed(ctx, newSess, m)
@@ -68,10 +69,10 @@ func (b *Bridge) cmdModel(ctx context.Context, m channel.InboundMessage, args st
 		focused = newSess
 	}
 	if err := focused.SwitchModel(modelName); err != nil {
-		b.sendText(ctx, m.ChatID, "切换模型失败: "+err.Error())
+		b.replyText(ctx, m, "切换模型失败: "+err.Error())
 		return
 	}
-	b.sendText(ctx, m.ChatID, "模型已切换为 "+modelName)
+	b.replyText(ctx, m, "模型已切换为 "+modelName)
 }
 
 // --- /diff ---
@@ -120,7 +121,7 @@ func (b *Bridge) cmdDiff(ctx context.Context, m channel.InboundMessage) {
 	}
 
 	if len(fileDiffs) == 0 && stat == "" {
-		b.sendCard(ctx, m.ChatID, channel.Card{
+		b.replyCard(ctx, m, channel.Card{
 			Title:    "Diff",
 			Tone:     channel.ToneNeutral,
 			Sections: []channel.Section{{Markdown: "No changes"}},
@@ -155,7 +156,7 @@ func (b *Bridge) cmdDiff(ctx context.Context, m channel.InboundMessage) {
 		}
 	}
 
-	b.sendCard(ctx, m.ChatID, channel.Card{
+	b.replyCard(ctx, m, channel.Card{
 		Title:    title,
 		Tone:     channel.ToneSuccess,
 		Sections: sections,
@@ -306,11 +307,11 @@ func (b *Bridge) cmdConfig(ctx context.Context, m channel.InboundMessage, args s
 	switch {
 	case args == "" || args == "show":
 		values := b.currentConfigValues()
-		b.sendCard(ctx, m.ChatID, buildConfigCard(values, b.envFilePath))
+		b.replyCard(ctx, m, buildConfigCard(values, b.envFilePath))
 	case strings.HasPrefix(args, "set "):
 		parts := strings.SplitN(strings.TrimPrefix(args, "set "), " ", 2)
 		if len(parts) < 2 {
-			b.sendText(ctx, m.ChatID, "用法: /config set <KEY> <VALUE>")
+			b.replyText(ctx, m, "用法: /config set <KEY> <VALUE>")
 			return
 		}
 		key := strings.ToUpper(strings.TrimSpace(parts[0]))
@@ -320,25 +321,25 @@ func (b *Bridge) cmdConfig(ctx context.Context, m channel.InboundMessage, args s
 		}
 		field, ok := FindConfigField(key)
 		if !ok {
-			b.sendText(ctx, m.ChatID, fmt.Sprintf("未知配置项: %s\n使用 /config 查看可用配置", key))
+			b.replyText(ctx, m, fmt.Sprintf("未知配置项: %s\n使用 /config 查看可用配置", key))
 			return
 		}
 		if b.envFilePath == "" {
-			b.sendText(ctx, m.ChatID, "未配置 .env 文件路径,无法保存")
+			b.replyText(ctx, m, "未配置 .env 文件路径,无法保存")
 			return
 		}
 		if err := WriteEnvFile(b.envFilePath, map[string]string{key: value}); err != nil {
-			b.sendText(ctx, m.ChatID, "写入配置失败: "+err.Error())
+			b.replyText(ctx, m, "写入配置失败: "+err.Error())
 			return
 		}
 		if field.Mutable {
 			b.applyConfigChange(key, value)
-			b.sendText(ctx, m.ChatID, fmt.Sprintf("✅ %s 已更新为 `%s`(已生效)", field.Label, value))
+			b.replyText(ctx, m, fmt.Sprintf("✅ %s 已更新为 `%s`(已生效)", field.Label, value))
 		} else {
-			b.sendText(ctx, m.ChatID, fmt.Sprintf("✅ %s 已写入 .env,重启后生效", field.Label))
+			b.replyText(ctx, m, fmt.Sprintf("✅ %s 已写入 .env,重启后生效", field.Label))
 		}
 	default:
-		b.sendText(ctx, m.ChatID, "用法:\n/config — 查看当前配置\n/config set <KEY> <VALUE> — 修改配置")
+		b.replyText(ctx, m, "用法:\n/config — 查看当前配置\n/config set <KEY> <VALUE> — 修改配置")
 	}
 }
 
@@ -356,9 +357,6 @@ func (b *Bridge) currentConfigValues() map[string]string {
 	}
 	if b.admin != nil {
 		values["ADMIN_MODEL"] = b.admin.model
-	}
-	if b.projectRoot != "" {
-		values["GATEWAY_PROJECT_ROOT"] = b.projectRoot
 	}
 	return values
 }
@@ -384,15 +382,10 @@ func (b *Bridge) applyConfigChange(key, value string) {
 		b.defaultCWD = dir
 		b.mu.Unlock()
 		b.mgr.AddAllowedBaseDir(dir)
+		b.mgr.SetDefaultWorkingDir(dir)
 		if b.admin != nil {
 			b.admin.setWorkingDir(dir)
 		}
-	case "GATEWAY_PROJECT_ROOT":
-		dir := expandHome(value)
-		b.mu.Lock()
-		b.projectRoot = dir
-		b.mu.Unlock()
-		b.mgr.AddAllowedBaseDir(dir)
 	case "GATEWAY_PERMISSION_MODE":
 		b.mgr.SetDefaultPermissionMode(NormalizePermissionMode(value))
 	case "GATEWAY_SHARE_EXTERNAL_SESSIONS":
@@ -552,7 +545,7 @@ func (b *Bridge) handleShell(ctx context.Context, m channel.InboundMessage, cmdS
 		text.WriteString(fmt.Sprintf("\n(exit code: %d)", exitCode))
 	}
 	body := fmt.Sprintf("```\n%s\n```", strings.TrimSpace(text.String()))
-	b.sendCard(ctx, m.ChatID, channel.Card{
+	b.replyCard(ctx, m, channel.Card{
 		Title:    "Shell",
 		Tone:     channel.ToneNeutral,
 		Sections: []channel.Section{{Markdown: body}},
@@ -563,16 +556,18 @@ func (b *Bridge) handleShell(ctx context.Context, m channel.InboundMessage, cmdS
 
 func (b *Bridge) handleSetup(ctx context.Context, m channel.InboundMessage, content string) {
 	if b.admin == nil || b.envFilePath == "" {
-		b.sendCard(ctx, m.ChatID, channel.Card{
-			Title:    "Welcome",
-			Tone:     channel.ToneWarning,
-			Sections: []channel.Section{{Markdown: "请先设置 GATEWAY_DEFAULT_CWD 环境变量后重启。"}},
+		b.replyCard(ctx, m, channel.Card{
+			Title: "Welcome",
+			Tone:  channel.ToneWarning,
+			Sections: []channel.Section{{
+				Markdown: "Gateway 缺少必要组件(admin / env 文件),无法接受配置。请检查启动参数 / 联系管理员。",
+			}},
 		})
 		return
 	}
 	configs, err := b.parseConfigFromNL(ctx, content)
 	if err != nil || len(configs) == 0 {
-		b.sendCard(ctx, m.ChatID, channel.Card{
+		b.replyCard(ctx, m, channel.Card{
 			Title: "Welcome",
 			Tone:  channel.ToneWarning,
 			Sections: []channel.Section{{
@@ -582,7 +577,7 @@ func (b *Bridge) handleSetup(ctx context.Context, m channel.InboundMessage, cont
 		return
 	}
 	if err := WriteEnvFile(b.envFilePath, configs); err != nil {
-		b.sendText(ctx, m.ChatID, "写入配置失败: "+err.Error())
+		b.replyText(ctx, m, "写入配置失败: "+err.Error())
 		return
 	}
 	var lines []string
@@ -591,20 +586,19 @@ func (b *Bridge) handleSetup(ctx context.Context, m channel.InboundMessage, cont
 		field, _ := FindConfigField(key)
 		if field.Mutable {
 			b.applyConfigChange(key, val)
-		} else if key != "GATEWAY_DEFAULT_CWD" && key != "GATEWAY_PROJECT_ROOT" {
+		} else {
 			needRestart = true
-		}
-		if key == "GATEWAY_DEFAULT_CWD" || key == "GATEWAY_PROJECT_ROOT" {
-			b.applyConfigChange(key, val)
 		}
 		lines = append(lines, fmt.Sprintf("- **%s** = `%s`", field.Label, val))
 	}
 	msg := "**配置已保存:**\n" + strings.Join(lines, "\n")
 	if needRestart {
-		msg += "\n\n部分配置需重启后生效。"
+		msg += "\n\n⚠️ 部分配置需重启后生效。"
+	} else {
+		msg += "\n\n✅ 已热生效,无需重启。"
 	}
 	msg += "\n\n现在可以直接发消息开始对话了。"
-	b.sendCard(ctx, m.ChatID, channel.Card{
+	b.replyCard(ctx, m, channel.Card{
 		Title:    "Config Saved",
 		Tone:     channel.ToneSuccess,
 		Sections: []channel.Section{{Markdown: msg}},
@@ -618,22 +612,22 @@ func (b *Bridge) handleSetup(ctx context.Context, m channel.InboundMessage, cont
 func (b *Bridge) cmdRename(ctx context.Context, m channel.InboundMessage, args string) {
 	title := strings.TrimSpace(args)
 	if title == "" {
-		b.sendText(ctx, m.ChatID, "用法: /rename <新名字>")
+		b.replyText(ctx, m, "用法: /rename <新名字>")
 		return
 	}
 
 	sess, ok := b.mgr.FocusedSession(m.UserID)
 	if !ok {
-		b.sendText(ctx, m.ChatID, "没有 active session")
+		b.replyText(ctx, m, "没有 active session")
 		return
 	}
 
 	if err := b.mgr.SetCustomTitle(sess.ID, title); err != nil {
-		b.sendText(ctx, m.ChatID, "重命名失败: "+err.Error())
+		b.replyText(ctx, m, "重命名失败: "+err.Error())
 		return
 	}
 	b.saveStateIfPossible()
-	b.sendText(ctx, m.ChatID, fmt.Sprintf("已重命名为 **%s**", title))
+	b.replyText(ctx, m, fmt.Sprintf("已重命名为 **%s**", title))
 }
 
 // limitedWriter caps how many bytes are written to its buffer.
@@ -654,19 +648,27 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 }
 
 func (b *Bridge) cmdBranch(ctx context.Context, m channel.InboundMessage, args string) {
+	if m.ThreadID != "" {
+		b.replyText(ctx, m, "请回主聊天 /branch(在话题里 fork 容易混淆)")
+		return
+	}
 	name := strings.TrimSpace(args)
 
 	focused, ok := b.mgr.FocusedSession(m.UserID)
 	if !ok {
-		b.sendText(ctx, m.ChatID, "没有 active session")
+		b.replyText(ctx, m, "没有 active session")
 		return
 	}
 
 	info := focused.Info()
 	if info.CLISessionID == "" {
-		b.sendText(ctx, m.ChatID, "当前 session 没有 CLI session ID，无法 branch")
+		b.replyText(ctx, m, "当前 session 没有 CLI session ID，无法 branch")
 		return
 	}
+
+	// Capture prior focus = the session we're branching FROM. We always
+	// keep the parent as main-chat focus and put the fork into a thread.
+	priorFocus := focused
 
 	// Pre-assign a UUID so the CLI uses it as its session ID (--session-id flag).
 	// This lets us stamp CLISessionID immediately rather than waiting for KindInit.
@@ -678,31 +680,38 @@ func (b *Bridge) cmdBranch(ctx context.Context, m channel.InboundMessage, args s
 		ResumeID:    info.CLISessionID,
 		ForkSession: "1",
 		SessionID:   forkCLISessionID,
-		Origin:      session.OriginFeishu,
+		Origin:      channelKindToOrigin(m.ChannelKind),
 		Label:       name,
 		ChatID:      m.ChatID,
 		ChannelKind: m.ChannelKind,
 	})
 	if err != nil {
-		b.sendText(ctx, m.ChatID, "创建 branch 失败: "+err.Error())
+		b.replyText(ctx, m, "创建 branch 失败: "+err.Error())
 		return
 	}
 
 	// Stamp the known CLI session ID immediately so /list shows it right away.
 	_ = b.mgr.SetCLISessionID(branchSess.ID, forkCLISessionID)
+	b.ensureSubscribed(ctx, branchSess, m)
 
-	if err := b.mgr.SetFocus(m.UserID, branchSess.ID); err != nil {
-		b.sendText(ctx, m.ChatID, fmt.Sprintf("Branch 已创建 (%s) 但切换失败: %s", shortID(forkCLISessionID), err.Error()))
+	branchSID := shortID(forkCLISessionID)
+	parentSID := displayIDFromInfo(info)
+	display := name
+	if display == "" {
+		display = projectName(info.WorkingDir)
+	}
+	body := fmt.Sprintf("%s · %s · 已分支自 %s · 进入话题发送消息", display, branchSID, parentSID)
+	msgID, cardErr := b.replyCard(ctx, m, channel.Card{
+		Title:    "Branch Created",
+		Tone:     channel.ToneSuccess,
+		Sections: []channel.Section{{Markdown: body}},
+	})
+	if cardErr != nil {
+		log.Printf("[bridge] cmdBranch: response card send failed: %v", cardErr)
 		return
 	}
-
-	b.ensureSubscribed(ctx, branchSess, m)
-	b.saveStateIfPossible()
-
-	msg := fmt.Sprintf("已创建 branch session: `%s`", shortID(forkCLISessionID))
-	if name != "" {
-		msg += fmt.Sprintf(" (%s)", name)
-	}
-	msg += fmt.Sprintf("\n原 session: `%s`", displayIDFromInfo(info))
-	b.sendText(ctx, m.ChatID, msg)
+	welcome := fmt.Sprintf("🌱 进入 branch [`%s`] · %s\n继承自 `%s` 的上下文,在这里继续聊。", branchSID, display, parentSID)
+	// /branch always opens a thread (forceThread=true). priorFocus must be
+	// non-nil here (we've already returned above when ok=false).
+	b.afterCreateOrActivate(ctx, branchSess, m.UserID, msgID, welcome, priorFocus, true)
 }

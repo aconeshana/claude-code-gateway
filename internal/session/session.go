@@ -138,6 +138,21 @@ type Session struct {
 	Origin            string // see OriginXxx constants — provenance of the session
 	ChatID      string
 	ChannelKind string
+
+	// ThreadID, when set, binds this session to a Lark thread. The bridge
+	// routes inbound messages carrying this ThreadID to this session, and
+	// outbound messages use the Reply API anchored at RootMessageID so the
+	// response stays inside the thread. Empty for sessions in the main chat
+	// and for non-Lark channels.
+	ThreadID      string
+	RootMessageID string
+
+	// MessageCount is the number of user-authored conversation turns on
+	// disk (extracted by Discoverer; incremented on each SendMessage for
+	// owned active sessions). Used by /list to show "· N 条消息". 0 means
+	// "unknown" (rendering omits it).
+	MessageCount int
+
 	Status      Status
 	ArchivedAt  time.Time
 
@@ -154,6 +169,16 @@ type Session struct {
 	cancelKeep   context.CancelFunc
 	spawnReq     runtime.SpawnRequest
 	switching    bool
+
+	// Last-inbound location for output routing. Transient; not persisted.
+	// streamSession uses these to decide where (main chat vs Lark thread) to
+	// post bot output, so it follows the user's most recent message location
+	// rather than the session's pinned thread binding. A user can therefore
+	// type in main chat → bot replies in main chat, even when the session is
+	// thread-bound (the thread entry card remains a separate access point).
+	lastInboundChatID    string
+	lastInboundThreadID  string
+	lastInboundRootMsgID string
 
 	// Summary-related runtime state (used by manager.AppendRecentMessage /
 	// ShouldUpdateSummary). Guarded by mu.
@@ -179,6 +204,9 @@ type SessionInfo struct {
 	Origin         string `json:"origin,omitempty"`
 	ChatID         string `json:"chat_id,omitempty"`
 	ChannelKind    string `json:"channel_kind,omitempty"`
+	ThreadID       string `json:"thread_id,omitempty"`
+	RootMessageID  string `json:"root_message_id,omitempty"`
+	MessageCount   int    `json:"message_count,omitempty"`
 	Status         string `json:"status,omitempty"`
 	ArchivedAt     string `json:"archived_at,omitempty"`
 }
@@ -241,12 +269,45 @@ func (s *Session) Info() SessionInfo {
 		Origin:         s.Origin,
 		ChatID:         s.ChatID,
 		ChannelKind:    s.ChannelKind,
+		ThreadID:       s.ThreadID,
+		RootMessageID:  s.RootMessageID,
+		MessageCount:   s.MessageCount,
 		Status:         string(s.Status),
 	}
 	if !s.ArchivedAt.IsZero() {
 		info.ArchivedAt = s.ArchivedAt.Format(time.RFC3339)
 	}
 	return info
+}
+
+// SetLastInbound records the chat / thread / root-message-id of the most
+// recent user message routed to this session. Bridge output (renderer cards,
+// streamed assistant text) consults this to decide where to post replies,
+// so a thread-bound session can still answer in main chat when the user
+// types there. Transient — not persisted across restarts.
+func (s *Session) SetLastInbound(chatID, threadID, rootMsgID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastInboundChatID = chatID
+	s.lastInboundThreadID = threadID
+	s.lastInboundRootMsgID = rootMsgID
+}
+
+// LastInbound returns the most recent inbound location (see SetLastInbound).
+// chatID is "" when no inbound has been recorded since spawn.
+func (s *Session) LastInbound() (chatID, threadID, rootMsgID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastInboundChatID, s.lastInboundThreadID, s.lastInboundRootMsgID
+}
+
+// SetMessageCount caches the user-turn count on the session. The bridge's
+// /list rendering backfills this via on-disk jsonl scan for sessions that
+// discovery didn't fill in (owned feishu sessions restored from state).
+func (s *Session) SetMessageCount(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.MessageCount = n
 }
 
 func (s *Session) SendMessage(content string) error {
@@ -256,6 +317,7 @@ func (s *Session) SendMessage(content string) error {
 		return fmt.Errorf("session %s is %s", s.ID, s.state)
 	}
 	s.pendingTurns++
+	s.MessageCount++
 	if s.state == StateReady || s.state == StateIdle {
 		s.state = StateProcessing
 	}
@@ -281,6 +343,7 @@ func (s *Session) SendMessageBlocks(blocks []interface{}) error {
 		return fmt.Errorf("session %s is %s", s.ID, s.state)
 	}
 	s.pendingTurns++
+	s.MessageCount++
 	if s.state == StateReady || s.state == StateIdle {
 		s.state = StateProcessing
 	}

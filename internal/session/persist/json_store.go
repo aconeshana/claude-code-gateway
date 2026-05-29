@@ -48,6 +48,9 @@ type PersistentSession struct {
 	CustomTitle       string `json:"custom_title,omitempty"`
 	LatestUserMessage string `json:"latest_user_message,omitempty"`
 	Origin            string `json:"origin,omitempty"`
+	ChannelKind       string `json:"channel_kind,omitempty"`
+	ThreadID          string `json:"thread_id,omitempty"`
+	RootMessageID     string `json:"root_message_id,omitempty"`
 	WorkingDir        string `json:"working_dir"`
 	ChatID            string `json:"chat_id"`
 	Status            string `json:"status,omitempty"`
@@ -261,7 +264,9 @@ func (s *JSONStore) Load(mgr *session.Manager) error {
 				Origin:            defaultOrigin(ps.Origin),
 				WorkingDir:        ps.WorkingDir,
 				ChatID:            ps.ChatID,
-				ChannelKind:       channel.KindFeishu,
+				ChannelKind:       defaultChannelKind(ps.ChannelKind),
+				ThreadID:          ps.ThreadID,
+				RootMessageID:     ps.RootMessageID,
 			})
 		}
 
@@ -284,7 +289,9 @@ func (s *JSONStore) Load(mgr *session.Manager) error {
 				Origin:            defaultOrigin(ps.Origin),
 				WorkingDir:        ps.WorkingDir,
 				ChatID:            ps.ChatID,
-				ChannelKind:       channel.KindFeishu,
+				ChannelKind:       defaultChannelKind(ps.ChannelKind),
+				ThreadID:          ps.ThreadID,
+				RootMessageID:     ps.RootMessageID,
 			}
 			if status == string(session.StatusArchived) {
 				_, _ = mgr.ImportArchivedSession(opts)
@@ -320,6 +327,15 @@ func defaultOrigin(o string) string {
 		return "feishu"
 	}
 	return o
+}
+
+// defaultChannelKind returns "feishu" for legacy records that pre-date the
+// ChannelKind field — every persisted session before H4-bis was from Feishu.
+func defaultChannelKind(k string) string {
+	if k == "" {
+		return channel.KindFeishu
+	}
+	return k
 }
 
 func (s *JSONStore) readFile() *PersistentState {
@@ -391,6 +407,9 @@ func buildCurrentState(mgr *session.Manager) *PersistentState {
 				CustomTitle:       info.CustomTitle,
 				LatestUserMessage: info.LatestUserMessage,
 				Origin:            info.Origin,
+				ChannelKind:       info.ChannelKind,
+				ThreadID:          info.ThreadID,
+				RootMessageID:     info.RootMessageID,
 				WorkingDir:        info.WorkingDir,
 				ChatID:            info.ChatID,
 				Status:            info.Status,

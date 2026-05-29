@@ -28,6 +28,7 @@ func (b *Bridge) streamSession(ctx context.Context, sess *session.Session, chatI
 	defer sess.Unsubscribe(subID)
 
 	state := &streamState{
+		sess:         sess,
 		project:      projectName(sess.WorkingDir),
 		sessionShort: displaySessionID(sess),
 		gitBranch:    getGitBranch(sess.WorkingDir),
@@ -63,10 +64,10 @@ func (b *Bridge) handleCLIExit(ctx context.Context, sess *session.Session, chatI
 	if cliID != "" {
 		b.mgr.TransitionToIdle(sess.ID)
 		if !userTerminated {
-			b.sendText(ctx, chatID, "Session "+displaySessionID(sess)+" 已变为 idle(发消息自动恢复)")
+			b.sendTextForSession(ctx, sess, chatID, "Session "+displaySessionID(sess)+" 已变为 idle(发消息自动恢复)")
 		}
 	} else {
-		b.sendText(ctx, chatID, "Session "+displaySessionID(sess)+" 已断开(CLI 未返回 session ID,无法保留)")
+		b.sendTextForSession(ctx, sess, chatID, "Session "+displaySessionID(sess)+" 已断开(CLI 未返回 session ID,无法保留)")
 		_ = b.mgr.Destroy(sess.ID)
 	}
 	b.mu.Lock()
@@ -93,6 +94,9 @@ func (b *Bridge) handleSessionEvent(ctx context.Context, sess *session.Session, 
 		if json.Unmarshal(raw, &sysMsg) == nil && sysMsg.Subtype == protocol.SubtypeInit {
 			state.mu.Lock()
 			state.model = sysMsg.Model
+			// init carries the CLI session id; refresh sessionShort so cards
+			// stop showing the placeholder gw:xxxx id.
+			state.sessionShort = displaySessionID(sess)
 			state.mu.Unlock()
 		}
 	case protocol.MsgTypeAssistant:
@@ -120,6 +124,7 @@ func (b *Bridge) handleSessionEvent(ctx context.Context, sess *session.Session, 
 // streamState batches assistant chunks and re-renders one card per interval.
 type streamState struct {
 	mu           sync.Mutex
+	sess         *session.Session // owning session — used to anchor outbound to its thread (if any)
 	messageID    string
 	project      string
 	sessionShort string
@@ -140,12 +145,18 @@ func (s *streamState) appendText(ctx context.Context, b *Bridge, chatID, text st
 	if s.finalized {
 		return
 	}
+	// Defensive refresh: if sessionShort was captured before the CLI emitted
+	// init (assistant text race), it would still be the "gw:xxx" placeholder.
+	// Re-resolve from the live session so cards never show stale ids.
+	if strings.HasPrefix(s.sessionShort, "gw:") {
+		s.sessionShort = displaySessionID(s.sess)
+	}
 	s.textBuf.WriteString(text)
 	s.dirty = true
 
 	if s.messageID == "" {
 		content := truncate(s.textBuf.String())
-		msgID, err := b.sendCard(ctx, chatID, b.processingCardWithID(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content))
+		msgID, err := b.sendCardForSession(ctx, s.sess, chatID, b.processingCardWithID(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content))
 		if err != nil {
 			return
 		}
@@ -215,10 +226,10 @@ func (s *streamState) finalize(ctx context.Context, b *Bridge, chatID string, re
 	card := b.resultCardWithID(project, sessionShort, summary, model, gitBranch, contextPct, content, result)
 	if msgID != "" {
 		if err := b.updateCard(ctx, msgID, card); err != nil {
-			_, _ = b.sendCard(ctx, chatID, card)
+			_, _ = b.sendCardForSession(ctx, s.sess, chatID, card)
 		}
 	} else {
-		_, _ = b.sendCard(ctx, chatID, card)
+		_, _ = b.sendCardForSession(ctx, s.sess, chatID, card)
 	}
 
 	s.mu.Lock()
@@ -480,7 +491,7 @@ func (b *Bridge) handleElicitation(ctx context.Context, sess *session.Session, c
 			sections = append(sections, channel.Section{Buttons: btns})
 		}
 	}
-	b.sendCard(ctx, chatID, channel.Card{
+	b.sendCardForSession(ctx, sess, chatID, channel.Card{
 		Title:    "Question",
 		Tone:     channel.ToneInfo,
 		Sections: sections,
@@ -501,7 +512,8 @@ func (b *Bridge) handlePlanPermission(ctx context.Context, sess *session.Session
 		return
 	}
 	var inner struct {
-		ToolUseID string `json:"tool_use_id"`
+		ToolUseID string                 `json:"tool_use_id"`
+		Input     map[string]interface{} `json:"input"`
 	}
 	_ = json.Unmarshal(req.Request, &inner)
 
@@ -511,10 +523,18 @@ func (b *Bridge) handlePlanPermission(ctx context.Context, sess *session.Session
 	desc := "Claude 请求进入**规划模式**,将先制定方案再执行。"
 	if toolName == "ExitPlanMode" {
 		title = "Plan Ready"
-		desc = "Claude 已完成规划,请审批后开始执行。"
+		// Claude's ExitPlanMode tool passes the plan body via input.plan as
+		// markdown text. Render it directly so the user can actually see what
+		// they're approving — without this the card just said "please review"
+		// with no review material.
+		if planText, _ := inner.Input["plan"].(string); planText != "" {
+			desc = planText
+		} else {
+			desc = "Claude 已完成规划,请审批后开始执行。"
+		}
 	}
 
-	b.sendCard(ctx, chatID, channel.Card{
+	b.sendCardForSession(ctx, sess, chatID, channel.Card{
 		Title: title,
 		Tone:  channel.ToneInfo,
 		Sections: []channel.Section{{
@@ -580,10 +600,10 @@ func (b *Bridge) handleElicitationAnswer(ctx context.Context, chatID, pendingID,
 	}
 	updatedInput["answers"] = map[string]interface{}{question: answer}
 	if err := sess.RespondPermission(pending.RequestID, pending.ToolUseID, "allow", "", updatedInput); err != nil {
-		b.sendText(ctx, chatID, "回复失败: "+err.Error())
+		b.sendTextForSession(ctx, sess, chatID, "回复失败: "+err.Error())
 		return
 	}
-	b.sendText(ctx, chatID, "已选择: "+answer)
+	b.sendTextForSession(ctx, sess, chatID, "已选择: "+answer)
 }
 
 // handlePlanResponse is invoked for EnterPlanMode / ExitPlanMode permissions.
@@ -603,7 +623,7 @@ func (b *Bridge) handlePlanResponse(ctx context.Context, chatID, pendingID, resu
 		behavior = "deny"
 	}
 	if err := sess.RespondPermission(pending.RequestID, pending.ToolUseID, behavior, "", nil); err != nil {
-		b.sendText(ctx, chatID, "回复失败: "+err.Error())
+		b.sendTextForSession(ctx, sess, chatID, "回复失败: "+err.Error())
 		return
 	}
 	title := "Plan Mode (Approved)"
@@ -614,7 +634,7 @@ func (b *Bridge) handlePlanResponse(ctx context.Context, chatID, pendingID, resu
 		tone = channel.ToneNeutral
 		body = "已拒绝。"
 	}
-	b.sendCard(ctx, chatID, channel.Card{
+	b.sendCardForSession(ctx, sess, chatID, channel.Card{
 		Title:    title,
 		Tone:     tone,
 		Sections: []channel.Section{{Markdown: body}},

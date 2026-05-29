@@ -52,6 +52,22 @@ type InboundHandler interface {
 	OnMessage(ctx context.Context, m InboundMessage)
 }
 
+// ThreadOpener is an optional capability for channels that support threads
+// (currently Feishu / Lark). Bridges detect support via type assertion:
+//
+//	if opener, ok := ch.(channel.ThreadOpener); ok { ... }
+//
+// Channels without thread support (e.g. DingTalk) simply don't implement
+// this interface, so the bridge degrades gracefully — sessions stay in the
+// main chat instead of being moved into a thread.
+type ThreadOpener interface {
+	// OpenThread sends a reply to anchorMsgID with reply_in_thread=true,
+	// causing the platform to spawn a new thread anchored at that message.
+	// Returns the new message id and the platform's thread id, both used by
+	// the bridge to bind the session to its thread for future routing.
+	OpenThread(ctx context.Context, anchorMsgID string, msg OutboundMessage) (msgID, threadID string, err error)
+}
+
 // InboundHandlerFunc is a function adapter for InboundHandler.
 type InboundHandlerFunc func(ctx context.Context, m InboundMessage)
 
@@ -82,6 +98,15 @@ type InboundMessage struct {
 	Text   string        // populated for InputText
 	Blocks []interface{} // populated for InputBlocks / InputImage
 	Action *CardAction   // populated for InputCardAction
+
+	// Lark thread context. Non-empty only on platforms that expose threads
+	// (currently Feishu). ThreadID is the stable per-thread identifier
+	// (omt_*); RootID is the message that started the thread (om_*);
+	// ParentID is the direct message being replied to (om_*). Bridges route
+	// inbound messages to a session by ThreadID when it's set.
+	ThreadID string
+	RootID   string
+	ParentID string
 
 	// Reply, when set by the channel, lets the handler synchronously supply a
 	// card to send back in the same response cycle. Only meaningful for
@@ -114,6 +139,17 @@ type OutboundMessage struct {
 	ChatID string
 	Card   *Card
 	Text   string
+
+	// ReplyToMessageID, when non-empty, tells the channel to use the platform's
+	// Reply API (anchored at this message) instead of creating an independent
+	// message. On Lark this puts the response in the same thread as the
+	// anchor. Channels without a reply primitive (e.g. DingTalk) ignore this.
+	ReplyToMessageID string
+
+	// OpenThread requests that the reply opens a new thread anchored at
+	// ReplyToMessageID. Only meaningful when ReplyToMessageID is set and the
+	// platform supports threads.
+	OpenThread bool
 }
 
 // Tone describes the visual style of a card. Implementations map this to a
