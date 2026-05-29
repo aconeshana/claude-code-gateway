@@ -80,15 +80,20 @@ func (b *Bridge) cmdStatus(ctx context.Context, m channel.InboundMessage) {
 		if display == "" {
 			display = displaySessionID(focused)
 		}
-		body += fmt.Sprintf("\nFocused: %s", display)
+		info := focused.Info()
+		project := projectName(info.WorkingDir)
+		body += fmt.Sprintf("\nFocused: %s · 项目: %s `%s`", display, project, info.WorkingDir)
+	} else {
+		body += "\nFocused: (无)"
 	}
+	body += fmt.Sprintf("\n项目数: %d (用 /project 查看)", len(b.projectsForUser(m.UserID)))
 	if b.shareExternalEnabled() {
 		extInfos := b.mgr.ListBy(session.Filter{Origins: []string{session.OriginExternal}})
 		body += fmt.Sprintf("\nExternal (terminal): %d (已启用共享)", len(extInfos))
 	}
 	sections = append(sections, channel.Section{Divider: true, Markdown: body})
 
-	b.sendCard(ctx, m.ChatID, channel.Card{
+	b.replyCard(ctx, m, channel.Card{
 		Title:    "Gateway Status",
 		Tone:     channel.ToneInfo,
 		Sections: sections,

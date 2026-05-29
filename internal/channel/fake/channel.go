@@ -19,6 +19,13 @@ type Channel struct {
 	handler  channel.InboundHandler
 	started  bool
 	nextID   int
+
+	// sendErrFunc, when set, lets tests inject an error per outbound call.
+	// Called with the OutboundMessage about to be sent; returning a non-nil
+	// error skips recording and propagates that error to the caller. Common
+	// use: simulate Lark's "reply anchor missing" so bridges can exercise the
+	// thread fallback path.
+	sendErrFunc func(channel.OutboundMessage) error
 }
 
 type Update struct {
@@ -53,9 +60,23 @@ func (c *Channel) Shutdown() {
 func (c *Channel) SendMessage(ctx context.Context, msg channel.OutboundMessage) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.sendErrFunc != nil {
+		if err := c.sendErrFunc(msg); err != nil {
+			return "", err
+		}
+	}
 	c.outbound = append(c.outbound, msg)
 	c.nextID++
 	return formatID(c.nextID), nil
+}
+
+// SetSendErrorFunc lets tests inject errors per outbound message. The function
+// is called BEFORE recording, so a non-nil error suppresses the outbound
+// record AND propagates the error to the caller. Pass nil to disable.
+func (c *Channel) SetSendErrorFunc(f func(channel.OutboundMessage) error) {
+	c.mu.Lock()
+	c.sendErrFunc = f
+	c.mu.Unlock()
 }
 
 func (c *Channel) UpdateMessage(ctx context.Context, messageID string, msg channel.OutboundMessage) error {
@@ -63,6 +84,31 @@ func (c *Channel) UpdateMessage(ctx context.Context, messageID string, msg chann
 	defer c.mu.Unlock()
 	c.updates = append(c.updates, Update{MessageID: messageID, Message: msg})
 	return nil
+}
+
+// OpenThread implements channel.ThreadOpener. The fake fabricates a
+// deterministic thread id keyed off the anchor and records the call as a
+// regular outbound message tagged with the anchor's ReplyToMessageID so
+// tests can assert on it.
+func (c *Channel) OpenThread(ctx context.Context, anchorMsgID string, msg channel.OutboundMessage) (string, string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sendErrFunc != nil {
+		recorded := msg
+		recorded.ReplyToMessageID = anchorMsgID
+		recorded.OpenThread = true
+		if err := c.sendErrFunc(recorded); err != nil {
+			return "", "", err
+		}
+	}
+	c.nextID++
+	msgID := formatID(c.nextID)
+	threadID := "fake-thread-" + anchorMsgID
+	recorded := msg
+	recorded.ReplyToMessageID = anchorMsgID
+	recorded.OpenThread = true
+	c.outbound = append(c.outbound, recorded)
+	return msgID, threadID, nil
 }
 
 func (c *Channel) Reaction(messageID, emoji string) error {

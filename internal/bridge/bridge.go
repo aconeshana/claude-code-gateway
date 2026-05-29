@@ -6,15 +6,20 @@ package bridge
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/anthropics/claude-code-gateway/internal/channel"
+	"github.com/anthropics/claude-code-gateway/internal/channel/feishu"
 	"github.com/anthropics/claude-code-gateway/internal/plan"
 	"github.com/anthropics/claude-code-gateway/internal/runtime"
+	claudeRT "github.com/anthropics/claude-code-gateway/internal/runtime/claude"
 	"github.com/anthropics/claude-code-gateway/internal/session"
 	"github.com/anthropics/claude-code-gateway/internal/session/persist"
 )
@@ -25,7 +30,6 @@ type Options struct {
 	Manager     *session.Manager
 	Channel     channel.Channel
 	DefaultCWD  string
-	ProjectRoot string
 
 	// EnvFilePath enables persistent /config changes. Empty disables.
 	EnvFilePath string
@@ -76,7 +80,6 @@ type Bridge struct {
 	ch  channel.Channel
 
 	defaultCWD      string
-	projectRoot     string
 	envFilePath     string
 	summaryInterval int
 
@@ -102,6 +105,12 @@ type Bridge struct {
 	// from an unexpected drop (notify).
 	terminating    map[string]bool
 	discoveryStats DiscoveryStats
+	// manualProjects: per-owner set of directories the user explicitly
+	// added via /project's directory picker but hasn't yet spawned a
+	// session in. Transient; once a session is created in that dir the
+	// projectsForUser fallback (deriving from session.WorkingDir) picks
+	// it up permanently.
+	manualProjects map[string]map[string]bool
 }
 
 // DiscoveryStats holds the latest scan progress (read by /status).
@@ -115,9 +124,6 @@ type DiscoveryStats struct {
 
 // New constructs a Bridge from the given options.
 func New(opts Options) *Bridge {
-	if opts.ProjectRoot == "" {
-		opts.ProjectRoot = opts.DefaultCWD
-	}
 	windowDays := opts.DiscoveryWindowDays
 	if windowDays == 0 && opts.Discoverer != nil {
 		windowDays = 7
@@ -130,7 +136,6 @@ func New(opts Options) *Bridge {
 		mgr:                 opts.Manager,
 		ch:                  opts.Channel,
 		defaultCWD:          opts.DefaultCWD,
-		projectRoot:         opts.ProjectRoot,
 		envFilePath:         opts.EnvFilePath,
 		summaryInterval:     opts.SummaryInterval,
 		persister:           opts.Persister,
@@ -142,6 +147,8 @@ func New(opts Options) *Bridge {
 		applyCLIPath:        opts.ApplyCLIPath,
 		subscribed:          make(map[string]bool),
 		pendingElicitations: make(map[string]*PendingElicitation),
+		terminating:         make(map[string]bool),
+		manualProjects:      make(map[string]map[string]bool),
 	}
 	if opts.AdminModel != "" {
 		b.admin = newAdmin(opts.Manager, opts.DefaultCWD, opts.AdminModel)
@@ -229,12 +236,16 @@ func (b *Bridge) handleText(ctx context.Context, m channel.InboundMessage) {
 	if !ok {
 		return
 	}
+	// Record where this message came from so streamSession can post the
+	// bot's reply back to the same location (main chat vs Lark thread)
+	// instead of the session's pinned thread.
+	sess.SetLastInbound(m.ChatID, m.ThreadID, threadAnchorFromInbound(m))
 	b.ensureSubscribed(ctx, sess, m)
 
 	_ = b.ch.Reaction(m.MessageID, "OnIt")
 
 	if err := sess.SendMessage(text); err != nil {
-		b.sendText(ctx, m.ChatID, "发送消息失败: "+err.Error())
+		b.replyText(ctx, m, "发送消息失败: "+err.Error())
 		return
 	}
 	b.mgr.AppendRecentMessage(sess.ID, text)
@@ -250,12 +261,13 @@ func (b *Bridge) handleBlocks(ctx context.Context, m channel.InboundMessage) {
 	if !ok {
 		return
 	}
+	sess.SetLastInbound(m.ChatID, m.ThreadID, threadAnchorFromInbound(m))
 	b.ensureSubscribed(ctx, sess, m)
 
 	_ = b.ch.Reaction(m.MessageID, "OnIt")
 
 	if err := sess.SendMessageBlocks(m.Blocks); err != nil {
-		b.sendText(ctx, m.ChatID, "发送图片消息失败: "+err.Error())
+		b.replyText(ctx, m, "发送图片消息失败: "+err.Error())
 		return
 	}
 	// Record a marker for the list UI's LatestUserMessage fallback — we
@@ -280,21 +292,113 @@ func (b *Bridge) handleBlocks(ctx context.Context, m channel.InboundMessage) {
 // --- Session lookup / creation ---
 
 func (b *Bridge) resolveOrCreateSession(ctx context.Context, m channel.InboundMessage) (*session.Session, bool) {
-	// 1. Focused session active in memory
+	// 0. Thread route (highest priority on platforms that support threads).
+	// A message arriving with ThreadID set means the user is typing inside
+	// a Lark thread; route to the session bound to that thread, creating /
+	// binding one if this is the first message in a brand-new thread.
+	if m.ThreadID != "" {
+		// Snapshot main-chat focus BEFORE any Reactivate/Create — both
+		// SetFocus to the new session, which would silently move main-chat
+		// focus to this thread's session. Restore at the end so the user's
+		// main-chat focus stays put when they type in a thread.
+		priorFocus := b.snapshotFocus(m.UserID)
+		restoreFocus := func(target *session.Session) {
+			if priorFocus == nil || target == nil || priorFocus.ID == target.ID {
+				return
+			}
+			_ = b.mgr.SetFocus(m.UserID, priorFocus.ID)
+		}
+
+		if sess, ok := b.mgr.GetByThreadID(m.ThreadID); ok {
+			if live, alive := b.mgr.Get(sess.ID); alive {
+				if live.Info().Status == string(session.StatusActive) {
+					return live, true
+				}
+				// Idle: reactivate so the next SendMessage works.
+				newSess, err := b.mgr.Reactivate(ctx, live.ID)
+				if err == nil {
+					b.ensureSubscribed(ctx, newSess, m)
+					restoreFocus(newSess)
+					b.saveStateIfPossible()
+					return newSess, true
+				}
+				log.Printf("[bridge] thread session %s reactivate failed: %v", displaySessionID(live), err)
+				// fall through to new-thread logic below
+			}
+		}
+		// Brand-new thread: bind it to the user's current focused session
+		// (if that session isn't already pinned to another thread); otherwise
+		// create a fresh session for this thread so each thread stays a
+		// physically separate context.
+		var target *session.Session
+		if focused, ok := b.mgr.FocusedSession(m.UserID); ok && focused.Info().ThreadID == "" {
+			target = focused
+		} else {
+			sess, err := b.mgr.Create(ctx, session.CreateOpts{
+				WorkingDir:  b.defaultCWD,
+				OwnerID:     m.UserID,
+				ChatID:      m.ChatID,
+				ChannelKind: m.ChannelKind,
+				Origin:      channelKindToOrigin(m.ChannelKind),
+			})
+			if err != nil {
+				b.replyText(ctx, m, "新建 session 失败: "+err.Error())
+				return nil, false
+			}
+			target = sess
+		}
+		rootID := m.RootID
+		if rootID == "" {
+			rootID = m.MessageID // first message in this thread is its root
+		}
+		_ = b.mgr.BindThread(target.ID, m.ThreadID, rootID)
+		restoreFocus(target)
+		b.saveStateIfPossible()
+		return target, true
+	}
+
+	// 1. Main-chat route: focused session.
+	// We don't gate on ThreadID anymore — a session can be focused in main
+	// chat AND bound to a Lark thread. The two are independent UI entry
+	// points to the same conversation; routing main-chat plain text to a
+	// thread-bound focused session is intentional.
 	if sess, ok := b.mgr.FocusedSession(m.UserID); ok {
 		if live, alive := b.mgr.Get(sess.ID); alive {
+			log.Printf("[bridge] route: focused session %s status=%s", displaySessionID(live), live.Info().Status)
 			return live, true
 		}
+	} else {
+		log.Printf("[bridge] route: no focused session for %s", shortID(m.UserID))
 	}
-	// 2. Resumable session (idle preferred)
-	if resumable := b.mgr.ResolveResumable(m.UserID); resumable != nil {
+	// 2. Resumable (idle preferred). Thread-bound sessions are valid
+	// candidates here; they can serve both main chat and their thread.
+	// Ghost sessions (CLI jsonl missing — typically /branch forks that were
+	// never typed into) are auto-archived and skipped so they don't keep
+	// catching auto-resume traffic.
+	for {
+		resumable := b.mgr.ResolveResumable(m.UserID)
+		if resumable == nil {
+			log.Printf("[bridge] route: ResolveResumable found nothing for %s", shortID(m.UserID))
+			break
+		}
+		log.Printf("[bridge] route: ResolveResumable -> %s status=%s", displaySessionID(resumable), resumable.Info().Status)
+		if !b.sessionAlive(resumable.Info()) {
+			log.Printf("[bridge] auto-archiving ghost session %s (jsonl missing)", displaySessionID(resumable))
+			if err := b.mgr.Archive(resumable.ID); err != nil {
+				log.Printf("[bridge] archive ghost %s failed: %v", displaySessionID(resumable), err)
+				break
+			}
+			b.saveStateIfPossible()
+			continue
+		}
 		newSess, err := b.mgr.Reactivate(ctx, resumable.ID)
 		if err == nil {
-			b.sendText(ctx, m.ChatID, "已自动恢复 session "+displaySessionID(newSess))
+			b.replyText(ctx, m, "已自动恢复 session "+displaySessionID(newSess))
 			b.saveStateIfPossible()
 			return newSess, true
 		}
 		log.Printf("[bridge] auto-resume %s failed: %v", displaySessionID(resumable), err)
+		break
 	}
 	// 3. Create new
 	sess, err := b.mgr.Create(ctx, session.CreateOpts{
@@ -305,7 +409,7 @@ func (b *Bridge) resolveOrCreateSession(ctx context.Context, m channel.InboundMe
 		Origin:      channelKindToOrigin(m.ChannelKind),
 	})
 	if err != nil {
-		b.sendText(ctx, m.ChatID, "自动创建 session 失败: "+err.Error())
+		b.replyText(ctx, m, "自动创建 session 失败: "+err.Error())
 		return nil, false
 	}
 	b.saveStateIfPossible()
@@ -323,6 +427,7 @@ func (b *Bridge) ensureSubscribed(ctx context.Context, sess *session.Session, m 
 	b.subscribed[sess.ID] = true
 	b.mu.Unlock()
 
+	log.Printf("[bridge] streamSession start: session=%s chat=%s thread=%s", displaySessionID(sess), shortID(m.ChatID), shortID(m.ThreadID))
 	go b.streamSession(ctx, sess, m.ChatID)
 }
 
@@ -350,10 +455,365 @@ func (b *Bridge) updateCard(ctx context.Context, messageID string, card channel.
 	return nil
 }
 
+// --- Thread-aware outbound helpers ---
+//
+// Use replyText/replyCard for messages produced in response to an inbound
+// event (command handlers, etc.). When the inbound arrived inside a Lark
+// thread, the reply automatically lands in that same thread; otherwise it
+// goes to the main chat. Use sendTextForSession/sendCardForSession for
+// out-of-band messages tied to a specific session (streamSession output,
+// etc.) — they anchor the reply to the session's bound thread root.
+//
+// Plain sendText/sendCard remain for messages that have no session/inbound
+// context (independent notifications, discovery worker results).
+
+func (b *Bridge) replyText(ctx context.Context, m channel.InboundMessage, text string) {
+	out := channel.OutboundMessage{ChatID: m.ChatID, Text: text}
+	if m.ThreadID != "" && m.MessageID != "" {
+		out.ReplyToMessageID = m.MessageID
+	}
+	if _, err := b.ch.SendMessage(ctx, out); err != nil {
+		// Anchor missing → drop the reply anchor and resend to the main chat.
+		// Don't notify the user here (replyText is often used for error
+		// messages itself; double-notification would be noisy).
+		if errors.Is(err, feishu.ErrReplyAnchorMissing) {
+			_, _ = b.ch.SendMessage(ctx, channel.OutboundMessage{ChatID: m.ChatID, Text: text})
+			return
+		}
+		log.Printf("[bridge] replyText failed: %v", err)
+	}
+}
+
+func (b *Bridge) replyCard(ctx context.Context, m channel.InboundMessage, card channel.Card) (string, error) {
+	out := channel.OutboundMessage{ChatID: m.ChatID, Card: &card}
+	if m.ThreadID != "" && m.MessageID != "" {
+		out.ReplyToMessageID = m.MessageID
+	}
+	id, err := b.ch.SendMessage(ctx, out)
+	if err != nil {
+		if errors.Is(err, feishu.ErrReplyAnchorMissing) {
+			id, err = b.ch.SendMessage(ctx, channel.OutboundMessage{ChatID: m.ChatID, Card: &card})
+		}
+		if err != nil {
+			log.Printf("[bridge] replyCard failed: %v", err)
+		}
+	}
+	return id, err
+}
+
+// threadAnchorFromInbound extracts the thread root message id for an inbound
+// message inside a Lark thread, falling back to the message's own id when
+// the platform didn't include root_id (which means this message IS the
+// thread root). Returns "" when not in a thread, signaling main-chat output.
+func threadAnchorFromInbound(m channel.InboundMessage) string {
+	if m.ThreadID == "" {
+		return ""
+	}
+	if m.RootID != "" {
+		return m.RootID
+	}
+	return m.MessageID
+}
+
+func (b *Bridge) sendTextForSession(ctx context.Context, sess *session.Session, chatID, text string) {
+	out := channel.OutboundMessage{ChatID: chatID, Text: text}
+	if sess != nil {
+		if liChatID, _, liRootMsgID := sess.LastInbound(); liChatID != "" {
+			// Follow user's most recent location instead of the session's
+			// pinned thread binding. Empty rootMsgID = main chat reply.
+			out.ChatID = liChatID
+			out.ReplyToMessageID = liRootMsgID
+		} else if anchor := sess.Info().RootMessageID; anchor != "" {
+			// No inbound location yet (rare — output before any user
+			// message). Fall back to the session's pinned thread so the
+			// thread entry card sees the new reply.
+			out.ReplyToMessageID = anchor
+		}
+	}
+	if _, err := b.ch.SendMessage(ctx, out); err != nil {
+		if b.handleOutboundError(ctx, sess, out.ChatID, err) {
+			_, _ = b.ch.SendMessage(ctx, channel.OutboundMessage{ChatID: out.ChatID, Text: text})
+			return
+		}
+		log.Printf("[bridge] sendTextForSession failed: %v", err)
+	}
+}
+
+func (b *Bridge) sendCardForSession(ctx context.Context, sess *session.Session, chatID string, card channel.Card) (string, error) {
+	out := channel.OutboundMessage{ChatID: chatID, Card: &card}
+	if sess != nil {
+		if liChatID, _, liRootMsgID := sess.LastInbound(); liChatID != "" {
+			out.ChatID = liChatID
+			out.ReplyToMessageID = liRootMsgID
+		} else if anchor := sess.Info().RootMessageID; anchor != "" {
+			out.ReplyToMessageID = anchor
+		}
+	}
+	id, err := b.ch.SendMessage(ctx, out)
+	if err != nil {
+		if b.handleOutboundError(ctx, sess, out.ChatID, err) {
+			id, err = b.ch.SendMessage(ctx, channel.OutboundMessage{ChatID: out.ChatID, Card: &card})
+		}
+		if err != nil {
+			log.Printf("[bridge] sendCardForSession failed: %v (session=%s anchor=%s)", err, displaySessionID(sess), shortID(out.ReplyToMessageID))
+		}
+	} else {
+		log.Printf("[bridge] sendCardForSession ok: session=%s msgID=%s anchor=%s", displaySessionID(sess), shortID(id), shortID(out.ReplyToMessageID))
+	}
+	return id, err
+}
+
+// handleOutboundError detects "thread anchor missing" failures from the Lark
+// Reply API and clears the session's thread binding so subsequent messages
+// fall back to the main chat. Returns true when a retry should be attempted
+// via plain Create (caller responsibility).
+func (b *Bridge) handleOutboundError(ctx context.Context, sess *session.Session, chatID string, err error) bool {
+	if err == nil || sess == nil {
+		return false
+	}
+	if !errors.Is(err, feishu.ErrReplyAnchorMissing) {
+		return false
+	}
+	_ = b.mgr.ClearThread(sess.ID)
+	b.saveStateIfPossible()
+	b.sendText(ctx, chatID, "话题已失效（根消息被删），已切回主聊天。")
+	return true
+}
+
+// --- Thread auto-open helpers ---
+
+// openThreadForSession opens a Lark thread anchored at anchorMsgID and binds
+// it to sess. Caller must already have a "framing" message in the main chat
+// (typically a "✅ 已创建 session xxx" card returned by replyCard); this
+// helper sends a follow-up reply that triggers the platform to spawn a new
+// thread, then records the binding so future inbound thread events route
+// back to sess.
+//
+// Reuse: if sess is already bound to a thread (e.g. surviving across a
+// gateway restart or a /terminate + /resume cycle), this pings the original
+// thread instead of opening a new one — keeps the main-chat free of
+// duplicate 话题入口卡. When the original thread's root has been deleted
+// the Reply API returns ErrReplyAnchorMissing; we clear the stale binding
+// and fall through to OpenThread, producing a fresh thread.
+//
+// If the channel does not implement ThreadOpener (e.g. DingTalk), the
+// session is left in the main chat and a fallback notification is logged.
+func (b *Bridge) openThreadForSession(ctx context.Context, sess *session.Session, anchorMsgID, welcome string) error {
+	info := sess.Info()
+	if info.ThreadID != "" && info.RootMessageID != "" {
+		// Reuse: reply into the existing thread. Lark will update the main
+		// chat's 话题入口卡 with a "new reply" badge so the user notices.
+		_, err := b.ch.SendMessage(ctx, channel.OutboundMessage{
+			ChatID:           info.ChatID,
+			Text:             welcome,
+			ReplyToMessageID: info.RootMessageID,
+		})
+		if err == nil {
+			log.Printf("[bridge] reused thread %s for session %s", shortID(info.ThreadID), displaySessionID(sess))
+			return nil
+		}
+		if !errors.Is(err, feishu.ErrReplyAnchorMissing) {
+			return fmt.Errorf("ping existing thread: %w", err)
+		}
+		// Original anchor is gone (user deleted thread root). Clear the
+		// stale binding and fall through to open a fresh thread.
+		log.Printf("[bridge] existing thread %s root missing, clearing and re-opening", shortID(info.ThreadID))
+		_ = b.mgr.ClearThread(sess.ID)
+		b.saveStateIfPossible()
+	}
+
+	opener, ok := b.ch.(channel.ThreadOpener)
+	if !ok {
+		log.Printf("[bridge] channel %s does not support threads; leaving session %s in main chat", b.ch.Kind(), displaySessionID(sess))
+		return nil
+	}
+	if anchorMsgID == "" {
+		return fmt.Errorf("openThreadForSession: anchorMsgID required")
+	}
+	_, threadID, err := opener.OpenThread(ctx, anchorMsgID, channel.OutboundMessage{Text: welcome})
+	if err != nil {
+		return fmt.Errorf("open thread: %w", err)
+	}
+	if threadID == "" {
+		return fmt.Errorf("open thread: platform returned empty thread_id")
+	}
+	if err := b.mgr.BindThread(sess.ID, threadID, anchorMsgID); err != nil {
+		return fmt.Errorf("bind thread: %w", err)
+	}
+	b.saveStateIfPossible()
+	log.Printf("[bridge] opened thread %s for session %s (anchor=%s)", shortID(threadID), displaySessionID(sess), shortID(anchorMsgID))
+	return nil
+}
+
+// hasMainChatFocus returns the focused session for ownerID iff that session
+// is currently active. Used to decide whether a newly created session should
+// take the main-chat focus or be opened in a thread instead.
+func (b *Bridge) hasMainChatFocus(ownerID string) bool {
+	focused, ok := b.mgr.FocusedSession(ownerID)
+	if !ok {
+		return false
+	}
+	return focused.Info().Status == string(session.StatusActive)
+}
+
+// snapshotFocus captures the active main-chat focus BEFORE a /new /resume
+// /branch creates or reactivates a session. Callers must capture this
+// upfront because mgr.Create / mgr.Reactivate eagerly SetFocus to the new
+// session, which clobbers the pre-existing focus.
+func (b *Bridge) snapshotFocus(ownerID string) *session.Session {
+	focused, ok := b.mgr.FocusedSession(ownerID)
+	if !ok || focused == nil {
+		return nil
+	}
+	if focused.Info().Status != string(session.StatusActive) {
+		return nil
+	}
+	return focused
+}
+
+// afterCreateOrActivate applies the unified "no prior focus → take focus,
+// has prior focus → open thread + restore" rule. priorFocus is the active
+// main-chat focus captured BEFORE newSess was created (use snapshotFocus).
+//
+// When priorFocus is nil, newSess keeps the focus that mgr.Create already
+// set. When priorFocus is non-nil, focus is restored to it and newSess is
+// moved into a freshly opened thread anchored at anchorMsgID.
+//
+// forceThread=true unconditionally opens a thread (used by /branch — the
+// fork is meant to be parallel, never the main-chat focus).
+func (b *Bridge) afterCreateOrActivate(ctx context.Context, newSess *session.Session, ownerID, anchorMsgID, welcome string, priorFocus *session.Session, forceThread bool) {
+	if priorFocus == nil && !forceThread {
+		// newSess keeps focus (already SetFocus'd by mgr.Create / Reactivate).
+		b.saveStateIfPossible()
+		return
+	}
+	// Restore prior focus (or, if forceThread without priorFocus, leave
+	// focus where it is — but in practice forceThread is only used by
+	// /branch, which always has a prior focus).
+	if priorFocus != nil {
+		_ = b.mgr.SetFocus(ownerID, priorFocus.ID)
+	}
+	if err := b.openThreadForSession(ctx, newSess, anchorMsgID, welcome); err != nil {
+		log.Printf("[bridge] auto-open thread for session %s failed: %v", displaySessionID(newSess), err)
+	}
+	b.saveStateIfPossible()
+}
+
 // needsSetup returns true when the bridge hasn't been configured with a
 // working directory yet (initial install).
 func (b *Bridge) needsSetup() bool {
 	return b.defaultCWD == "" || b.defaultCWD == "."
+}
+
+// sessionAlive returns false for sessions whose backing claude-code jsonl
+// file is missing — typically `/branch` fork sessions that pre-assigned a
+// CLI session id but never received a user message, so the CLI never wrote
+// the transcript. Reviving such a session would fail with "No conversation
+// found"; the gateway uses this check to filter ghosts out of /list views
+// and to skip them in auto-resume routing.
+//
+// CLISessionID==""  → return true (session hasn't fully bootstrapped yet,
+// not a ghost).
+// Bridge-only / non-claude sessions return true (no jsonl to check).
+func (b *Bridge) sessionAlive(info session.SessionInfo) bool {
+	if info.CLISessionID == "" {
+		return true
+	}
+	path := claudeRT.SessionJSONLPath(info.WorkingDir, info.CLISessionID)
+	if path == "" {
+		return true
+	}
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	return true
+}
+
+// resolveSessionByPayload looks up a session by an id pulled out of a card
+// action payload. We accept both gateway-internal session.ID and the
+// runtime's CLI session id because mgr.Reactivate generates a NEW
+// gateway-internal id on each reactivation — a card that was rendered
+// before a thread message triggered a reactivate would otherwise carry a
+// stale id and the action would fail with "session 不存在".
+func (b *Bridge) resolveSessionByPayload(id string) (*session.Session, bool) {
+	if id == "" {
+		return nil, false
+	}
+	if sess, ok := b.mgr.Get(id); ok {
+		return sess, true
+	}
+	if sess, ok := b.mgr.GetByCLISessionID(id); ok {
+		return sess, true
+	}
+	return nil, false
+}
+
+// filterAliveSessions returns a new slice with ghost sessions removed.
+// It also opportunistically backfills MessageCount for owned sessions that
+// have a jsonl on disk but no count yet (the discoverer only fills it for
+// external imports; owned feishu sessions go through state restore and
+// would otherwise show no "· N 条" badge).
+func (b *Bridge) filterAliveSessions(in []session.SessionInfo) []session.SessionInfo {
+	if len(in) == 0 {
+		return in
+	}
+	out := make([]session.SessionInfo, 0, len(in))
+	for _, info := range in {
+		if !b.sessionAlive(info) {
+			continue
+		}
+		if info.MessageCount == 0 && info.CLISessionID != "" {
+			path := claudeRT.SessionJSONLPath(info.WorkingDir, info.CLISessionID)
+			if path != "" {
+				if n := countUserTurnsInJSONL(path); n > 0 {
+					info.MessageCount = n
+					if sess, ok := b.mgr.Get(info.ID); ok {
+						sess.SetMessageCount(n)
+					}
+				}
+			}
+		}
+		out = append(out, info)
+	}
+	return out
+}
+
+// countUserTurnsInJSONL streams the jsonl file and counts user-authored
+// conversation turns. Cheap (~50ms per 50MB file). Returns 0 on error.
+func countUserTurnsInJSONL(path string) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	const needle = `"type":"user"`
+	buf := make([]byte, 64*1024)
+	n := 0
+	leftover := []byte{}
+	for {
+		nr, err := f.Read(buf)
+		if nr > 0 {
+			data := append(leftover, buf[:nr]...)
+			start := 0
+			for i := 0; i < len(data); i++ {
+				if data[i] == '\n' {
+					line := data[start:i]
+					if strings.Contains(string(line), needle) {
+						n++
+					}
+					start = i + 1
+				}
+			}
+			leftover = data[start:]
+		}
+		if err != nil {
+			break
+		}
+	}
+	if len(leftover) > 0 && strings.Contains(string(leftover), needle) {
+		n++
+	}
+	return n
 }
 
 func shortID(s string) string {

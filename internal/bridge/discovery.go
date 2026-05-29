@@ -124,6 +124,7 @@ func (b *Bridge) runDiscovery(ctx context.Context) {
 			LatestUserMessage: r.InitialSummary,
 			Origin:            session.OriginExternal,
 			LastActivity:      r.LastActivity,
+			MessageCount:      r.MessageCount,
 		})
 		if err != nil {
 			log.Printf("[discovery] import %s failed: %v", r.RuntimeID, err)

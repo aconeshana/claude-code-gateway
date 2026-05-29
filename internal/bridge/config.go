@@ -27,8 +27,7 @@ type ConfigField struct {
 
 // ConfigFields enumerates the settings exposed via /config.
 var ConfigFields = []ConfigField{
-	{EnvKey: "GATEWAY_DEFAULT_CWD", Label: "默认工作目录", Required: true, Default: "."},
-	{EnvKey: "GATEWAY_PROJECT_ROOT", Label: "项目基准目录(/new <子目录> 解析基准)", Mutable: true},
+	{EnvKey: "GATEWAY_DEFAULT_CWD", Label: "默认工作目录(主聊天 plain text 兜底)", Default: "~", Mutable: true},
 	{EnvKey: "SUMMARY_INTERVAL", Label: "摘要更新轮数(每 N 条用户消息后重生成,0=关闭)", Mutable: true, Default: "5"},
 	{EnvKey: "ADMIN_MODEL", Label: "管理员 AI 模型", Mutable: true, Default: "claude-haiku-4-5"},
 	{EnvKey: "GATEWAY_SHARE_EXTERNAL_SESSIONS", Label: "共享外部 session(terminal/SDK 等创建的)", Default: "false", Type: "bool", Mutable: true},

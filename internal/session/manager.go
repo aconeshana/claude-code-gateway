@@ -201,6 +201,21 @@ func (m *Manager) SetDefaultPermissionMode(mode string) {
 	m.defaultPermMode = mode
 }
 
+// SetDefaultWorkingDir updates the working directory used for newly created
+// sessions when CreateOpts.WorkingDir is empty. Existing sessions keep their
+// own WorkingDir. Used by the bridge's /config hot-reload of
+// GATEWAY_DEFAULT_CWD so newly typed messages immediately route to the
+// configured project without a process restart.
+func (m *Manager) SetDefaultWorkingDir(dir string) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.defaultWorkingDir = abs
+}
+
 // SetSummaryStore wires up the persistence backend for external-session
 // augmentation. Optional — without it, ExternalSummary* methods are no-ops.
 func (m *Manager) SetSummaryStore(s SummaryStore) {

@@ -180,6 +180,16 @@ func (w *summaryWorker) process(ctx context.Context, job summaryJob) {
 	}
 }
 
+// RefreshNow synchronously regenerates the summary for sessionID using
+// sourceRef as the transcript file. Bypasses the worker queue — used by the
+// [刷新摘要] button so user clicks aren't blocked behind background tasks.
+// admin.query itself is still serialized via admin.mu (one CLI process),
+// so a refresh may briefly wait for an in-flight worker job to finish, but
+// won't be queued behind pending ones.
+func (w *summaryWorker) RefreshNow(ctx context.Context, sessionID, sourceRef string) error {
+	return w.regenerate(ctx, summaryJob{SessionID: sessionID, SourceRef: sourceRef})
+}
+
 func (w *summaryWorker) regenerate(ctx context.Context, job summaryJob) error {
 	if w.admin == nil {
 		return fmt.Errorf("admin not configured")

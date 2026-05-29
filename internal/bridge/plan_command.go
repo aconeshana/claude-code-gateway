@@ -31,11 +31,11 @@ func (b *Bridge) planIndex() *plan.Index {
 func (b *Bridge) cmdPlanList(ctx context.Context, m channel.InboundMessage) {
 	plans, err := b.planIndex().List()
 	if err != nil {
-		b.sendText(ctx, m.ChatID, "读取 plan 目录失败: "+err.Error())
+		b.replyText(ctx, m, "读取 plan 目录失败: "+err.Error())
 		return
 	}
 	if len(plans) == 0 {
-		b.sendCard(ctx, m.ChatID, channel.Card{
+		b.replyCard(ctx, m, channel.Card{
 			Title:    "Plans",
 			Tone:     channel.ToneInfo,
 			Sections: []channel.Section{{Markdown: "暂无 plan。用 `/plan <description>` 进入 plan mode 让 Claude 生成第一份。"}},
@@ -43,6 +43,12 @@ func (b *Bridge) cmdPlanList(ctx context.Context, m channel.InboundMessage) {
 		return
 	}
 	sections := make([]channel.Section, 0, len(plans)+1)
+	// Lark card-action events don't carry thread context, so embed it into
+	// the button action and let handleCardAction restore m.ThreadID before
+	// dispatching. Without this, [查看] in a thread would silently post the
+	// plan detail to the main chat.
+	threadID := m.ThreadID
+	rootMsgID := threadAnchorFromInbound(m)
 	for _, p := range plans {
 		title := p.Title
 		if title == "" {
@@ -50,11 +56,16 @@ func (b *Bridge) cmdPlanList(ctx context.Context, m channel.InboundMessage) {
 		}
 		body := fmt.Sprintf("**%s**\n%s · %s",
 			title, humanAgo(time.Since(p.MTime)), humanSize(p.Size))
+		action := map[string]string{"action": "show_plan", "filename": p.Filename}
+		if threadID != "" {
+			action["thread_id"] = threadID
+			action["root_id"] = rootMsgID
+		}
 		sections = append(sections, channel.Section{
 			Markdown: body,
 			Buttons: []channel.Button{{
 				Label: "查看", Style: "primary",
-				Action: map[string]string{"action": "show_plan", "filename": p.Filename},
+				Action: action,
 			}},
 		})
 	}
@@ -62,7 +73,7 @@ func (b *Bridge) cmdPlanList(ctx context.Context, m channel.InboundMessage) {
 		Divider: true,
 		Note:    fmt.Sprintf("Plans 目录: %s · 共 %d 份", b.planIndex().Dir(), len(plans)),
 	})
-	b.sendCard(ctx, m.ChatID, channel.Card{
+	b.replyCard(ctx, m, channel.Card{
 		Title:    "Plans · 按最近修改",
 		Tone:     channel.ToneInfo,
 		Sections: sections,
@@ -77,7 +88,7 @@ func (b *Bridge) cmdPlanList(ctx context.Context, m channel.InboundMessage) {
 func (b *Bridge) showPlanDetail(ctx context.Context, m channel.InboundMessage, filename string) {
 	p, err := b.planIndex().Get(filename)
 	if err != nil {
-		b.sendText(ctx, m.ChatID, "读取 plan 失败: "+err.Error())
+		b.replyText(ctx, m, "读取 plan 失败: "+err.Error())
 		return
 	}
 	header := fmt.Sprintf("**%s**\n_%s · %s · %s_",
@@ -86,7 +97,7 @@ func (b *Bridge) showPlanDetail(ctx context.Context, m channel.InboundMessage, f
 		humanAgo(time.Since(p.MTime)),
 		humanSize(p.Size),
 	)
-	b.sendCard(ctx, m.ChatID, channel.Card{
+	b.replyCard(ctx, m, channel.Card{
 		Title: "Plan",
 		Tone:  channel.ToneNeutral,
 		Sections: []channel.Section{

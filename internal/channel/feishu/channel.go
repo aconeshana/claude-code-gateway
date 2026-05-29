@@ -103,14 +103,33 @@ func (c *Channel) Shutdown() {
 }
 
 // SendMessage delivers an outbound message. Card takes precedence over Text.
+// When msg.ReplyToMessageID is non-empty, the Reply API is used so the
+// response lands in the same thread (or opens a new one if OpenThread=true).
 func (c *Channel) SendMessage(ctx context.Context, msg channel.OutboundMessage) (string, error) {
-	if msg.Card != nil {
-		return c.sendCard(ctx, string(msg.ChatID), renderCard(*msg.Card))
+	var (
+		msgType string
+		content string
+	)
+	switch {
+	case msg.Card != nil:
+		msgType = "interactive"
+		content = renderCard(*msg.Card)
+	case msg.Text != "":
+		msgType = "text"
+		raw, _ := json.Marshal(map[string]string{"text": msg.Text})
+		content = string(raw)
+	default:
+		return "", fmt.Errorf("OutboundMessage has neither Card nor Text")
 	}
-	if msg.Text != "" {
-		return "", c.sendText(ctx, string(msg.ChatID), msg.Text)
+
+	if msg.ReplyToMessageID != "" {
+		msgID, _, err := c.sendReply(ctx, msg.ReplyToMessageID, msgType, content, msg.OpenThread)
+		return msgID, err
 	}
-	return "", fmt.Errorf("OutboundMessage has neither Card nor Text")
+	if msgType == "interactive" {
+		return c.sendCard(ctx, string(msg.ChatID), content)
+	}
+	return "", c.sendText(ctx, string(msg.ChatID), msg.Text)
 }
 
 func (c *Channel) UpdateMessage(ctx context.Context, messageID string, msg channel.OutboundMessage) error {
@@ -205,6 +224,101 @@ func (c *Channel) sendText(ctx context.Context, chatID, text string) error {
 		}
 		return 0, "", nil
 	})
+}
+
+// sendReply posts a reply to anchorMsgID using the Lark Reply API. When
+// openThread is true the reply opens a new thread anchored at that message
+// (only effective for the first reply to a given anchor). Returns the new
+// message id, the thread id (only meaningful when openThread is true OR the
+// anchor is already in a thread), and any error. The returned error is
+// wrapped with replyErrNotFound when the anchor was deleted / no longer
+// accessible (HTTP body code 230020 — message not exist) so callers can
+// fall back to a plain Create.
+func (c *Channel) sendReply(ctx context.Context, anchorMsgID, msgType, content string, openThread bool) (msgID, threadID string, err error) {
+	body := larkim.NewReplyMessageReqBodyBuilder().
+		MsgType(msgType).
+		Content(content)
+	if openThread {
+		body = body.ReplyInThread(true)
+	}
+	req := larkim.NewReplyMessageReqBuilder().
+		MessageId(anchorMsgID).
+		Body(body.Build()).
+		Build()
+
+	err = c.withTokenRetry("sendReply", func() (int, string, error) {
+		resp, err := c.client.Im.Message.Reply(ctx, req)
+		if err != nil {
+			return 0, "", err
+		}
+		if !resp.Success() {
+			return resp.Code, resp.Msg, nil
+		}
+		if resp.Data != nil {
+			if resp.Data.MessageId != nil {
+				msgID = *resp.Data.MessageId
+			}
+			if resp.Data.ThreadId != nil {
+				threadID = *resp.Data.ThreadId
+			}
+		}
+		return 0, "", nil
+	})
+	if err != nil && isReplyAnchorMissing(err) {
+		return msgID, threadID, errReplyAnchorMissing
+	}
+	return msgID, threadID, err
+}
+
+// OpenThread implements channel.ThreadOpener. It uses the Lark Reply API
+// with reply_in_thread=true so the platform creates a new thread anchored at
+// anchorMsgID, returning the new message id and the thread id for the bridge
+// to bind to the session.
+func (c *Channel) OpenThread(ctx context.Context, anchorMsgID string, msg channel.OutboundMessage) (string, string, error) {
+	var (
+		msgType string
+		content string
+	)
+	switch {
+	case msg.Card != nil:
+		msgType = "interactive"
+		content = renderCard(*msg.Card)
+	case msg.Text != "":
+		msgType = "text"
+		raw, _ := json.Marshal(map[string]string{"text": msg.Text})
+		content = string(raw)
+	default:
+		return "", "", fmt.Errorf("OpenThread: OutboundMessage has neither Card nor Text")
+	}
+	return c.sendReply(ctx, anchorMsgID, msgType, content, true)
+}
+
+// errReplyAnchorMissing is returned by sendReply when the anchor message no
+// longer exists (the user deleted the thread root or the message). Bridge
+// catches this to clear the session's thread binding and fall back to
+// Create-to-main-chat with a user notification.
+var errReplyAnchorMissing = fmt.Errorf("feishu: reply anchor missing")
+
+// ErrReplyAnchorMissing is the exported sentinel for the same condition.
+// Bridges should errors.Is(err, feishu.ErrReplyAnchorMissing) to detect a
+// stale thread binding and recover (clear ThreadID, resend via main chat).
+var ErrReplyAnchorMissing = errReplyAnchorMissing
+
+// isReplyAnchorMissing matches the Lark body-level codes that mean
+// "anchor message gone": 230020 (message not exist), 230002 (message
+// recalled), 230001 (no permission to operate). Treats them all as
+// recoverable by clearing the thread binding.
+func isReplyAnchorMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, code := range []string{"code=230020", "code=230002", "code=230001"} {
+		if strings.Contains(s, code) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Channel) updateCard(ctx context.Context, messageID, cardJSON string) error {
@@ -339,6 +453,9 @@ func (c *Channel) onMessageReceive(ctx context.Context, event *larkim.P2MessageR
 		UserID:      userID,
 		ChatID:      chatID,
 		MessageID:   msgID,
+		ThreadID:    derefStr(msg.ThreadId),
+		RootID:      derefStr(msg.RootId),
+		ParentID:    derefStr(msg.ParentId),
 	}
 
 	msgType := ""
@@ -694,4 +811,11 @@ func shortID(s string) string {
 		return s
 	}
 	return s[:8]
+}
+
+func derefStr(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }

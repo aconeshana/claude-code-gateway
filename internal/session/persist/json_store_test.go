@@ -298,3 +298,86 @@ func TestPersist_CountSurvivesReload(t *testing.T) {
 		t.Errorf("after reload: count = %d, want 2", got)
 	}
 }
+
+func TestPersist_ThreadRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	store := NewJSONStore(path)
+
+	mgr := newTestManager(t)
+	_, err := mgr.ImportIdleSession(session.ImportOpts{
+		CLISessionID:  "cli-1",
+		OwnerID:       "alice",
+		Label:         "thread-session",
+		Origin:        "feishu",
+		WorkingDir:    "/tmp/proj",
+		ChatID:        "chat-1",
+		ChannelKind:   "feishu",
+		ThreadID:      "omt_thread_xyz",
+		RootMessageID: "om_root_abc",
+	})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if err := store.Save(mgr); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	mgr2 := newTestManager(t)
+	store2 := NewJSONStore(path)
+	if err := store2.Load(mgr2); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	infos := mgr2.ListBy(session.Filter{OwnerID: "alice"})
+	if len(infos) != 1 {
+		t.Fatalf("got %d sessions, want 1", len(infos))
+	}
+	if infos[0].ThreadID != "omt_thread_xyz" {
+		t.Errorf("ThreadID = %q, want omt_thread_xyz", infos[0].ThreadID)
+	}
+	if infos[0].RootMessageID != "om_root_abc" {
+		t.Errorf("RootMessageID = %q, want om_root_abc", infos[0].RootMessageID)
+	}
+}
+
+func TestPersist_LegacyMissingThreadIsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	legacy := PersistentState{
+		Users: map[string]*PersistentUser{
+			"alice": {
+				FocusedCLIID: "cli-1",
+				Sessions: []PersistentSession{
+					{
+						CLISessionID: "cli-1",
+						Label:        "pre-thread",
+						Origin:       "feishu",
+						WorkingDir:   "/tmp/proj",
+						Status:       "idle",
+						// ThreadID / RootMessageID intentionally absent
+					},
+				},
+			},
+		},
+	}
+	data, _ := json.MarshalIndent(legacy, "", "  ")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatalf("write legacy: %v", err)
+	}
+
+	mgr := newTestManager(t)
+	store := NewJSONStore(path)
+	if err := store.Load(mgr); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	infos := mgr.ListBy(session.Filter{OwnerID: "alice"})
+	if len(infos) != 1 {
+		t.Fatalf("got %d sessions, want 1", len(infos))
+	}
+	if infos[0].ThreadID != "" {
+		t.Errorf("legacy ThreadID = %q, want empty", infos[0].ThreadID)
+	}
+	if infos[0].RootMessageID != "" {
+		t.Errorf("legacy RootMessageID = %q, want empty", infos[0].RootMessageID)
+	}
+}

@@ -414,3 +414,81 @@ func TestManager_SetFocus(t *testing.T) {
 		t.Error("SetFocus on session owned by alice should error for bob")
 	}
 }
+
+// TestManager_ReactivateCarriesThreadBinding locks in Bug A's fix:
+// Reactivate generates a brand-new session record, but must copy ThreadID
+// + RootMessageID from the old session so thread-routed plain text keeps
+// reaching this session across reactivates.
+func TestManager_ReactivateCarriesThreadBinding(t *testing.T) {
+	mgr, _ := newOwnedManager(t)
+	idOld, err := mgr.ImportIdleSession(ImportOpts{
+		CLISessionID:  "cli-thread",
+		OwnerID:       "alice",
+		Origin:        OriginFeishu,
+		ThreadID:      "omt_persist",
+		RootMessageID: "om_root_persist",
+	})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	newSess, err := mgr.Reactivate(context.Background(), idOld)
+	if err != nil {
+		t.Fatalf("reactivate: %v", err)
+	}
+	if newSess.ID == idOld {
+		t.Errorf("Reactivate should generate a new gateway id, got same %s", idOld)
+	}
+	info := newSess.Info()
+	if info.ThreadID != "omt_persist" {
+		t.Errorf("ThreadID lost across Reactivate: %q", info.ThreadID)
+	}
+	if info.RootMessageID != "om_root_persist" {
+		t.Errorf("RootMessageID lost across Reactivate: %q", info.RootMessageID)
+	}
+	// GetByThreadID must still find the new session.
+	got, ok := mgr.GetByThreadID("omt_persist")
+	if !ok || got.ID != newSess.ID {
+		t.Errorf("GetByThreadID broke after Reactivate")
+	}
+}
+
+func TestManager_BindAndGetByThreadID(t *testing.T) {
+	mgr, _ := newOwnedManager(t)
+	id, err := mgr.ImportIdleSession(ImportOpts{
+		CLISessionID: "cli-x", OwnerID: "alice", Origin: OriginFeishu,
+	})
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if _, ok := mgr.GetByThreadID(""); ok {
+		t.Error("empty threadID should not match anything")
+	}
+	if _, ok := mgr.GetByThreadID("omt_unknown"); ok {
+		t.Error("unknown thread should not match")
+	}
+
+	if err := mgr.BindThread(id, "omt_abc", "om_root_1"); err != nil {
+		t.Fatalf("BindThread: %v", err)
+	}
+
+	sess, ok := mgr.GetByThreadID("omt_abc")
+	if !ok {
+		t.Fatal("GetByThreadID after Bind returned ok=false")
+	}
+	info := sess.Info()
+	if info.ThreadID != "omt_abc" || info.RootMessageID != "om_root_1" {
+		t.Errorf("info = (thread=%q root=%q), want (omt_abc, om_root_1)", info.ThreadID, info.RootMessageID)
+	}
+
+	// Clear and ensure lookup misses
+	if err := mgr.ClearThread(id); err != nil {
+		t.Fatalf("ClearThread: %v", err)
+	}
+	if _, ok := mgr.GetByThreadID("omt_abc"); ok {
+		t.Error("after ClearThread, GetByThreadID should not match")
+	}
+	if got := sess.Info(); got.ThreadID != "" || got.RootMessageID != "" {
+		t.Errorf("after Clear: thread=%q root=%q, want empty", got.ThreadID, got.RootMessageID)
+	}
+}

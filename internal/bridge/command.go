@@ -70,7 +70,7 @@ func (b *Bridge) forwardToCLI(ctx context.Context, m channel.InboundMessage, _ s
 	b.ensureSubscribed(ctx, sess, m)
 	_ = b.ch.Reaction(m.MessageID, "OnIt")
 	if err := sess.SendMessage(text); err != nil {
-		b.sendText(ctx, m.ChatID, "发送命令失败: "+err.Error())
+		b.replyText(ctx, m, "发送命令失败: "+err.Error())
 	}
 }
 

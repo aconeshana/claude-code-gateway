@@ -52,9 +52,6 @@ func cmdServe() {
 		cfg.KeepAliveInterval,
 		cfg.SessionIdleTimeout,
 	)
-	if cfg.ProjectRoot != "" {
-		mgr.AddAllowedBaseDir(cfg.ProjectRoot)
-	}
 
 	registry := runtime.NewRegistry()
 	registry.Register(claude.Factory{})
@@ -95,7 +92,6 @@ func cmdServe() {
 			Manager:             mgr,
 			Channel:             feiCh,
 			DefaultCWD:          cfg.DefaultWorkingDir,
-			ProjectRoot:         cfg.ProjectRoot,
 			EnvFilePath:         cfg.EnvFilePath,
 			AdminModel:          cfg.AdminModel,
 			SummaryInterval:     cfg.SummaryInterval,
@@ -130,7 +126,6 @@ func cmdServe() {
 			Manager:             mgr,
 			Channel:             dtCh,
 			DefaultCWD:          cfg.DefaultWorkingDir,
-			ProjectRoot:         cfg.ProjectRoot,
 			EnvFilePath:         cfg.EnvFilePath,
 			AdminModel:          cfg.AdminModel,
 			SummaryInterval:     cfg.SummaryInterval,

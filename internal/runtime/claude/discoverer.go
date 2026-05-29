@@ -235,7 +235,39 @@ func parseSession(path string, mtime time.Time) (runtime.DiscoveredSession, erro
 		rec.IsAdminInternal = true
 	}
 
+	// Count user-authored turns by streaming the whole file once and looking
+	// for `"type":"user"` lines. This is the cheapest accurate measure of
+	// "how much real conversation happened" — admin-internal sessions are
+	// already filtered above so this number reflects actual user turns.
+	// Skip the count for admin-internal records to save the I/O.
+	if !rec.IsAdminInternal {
+		if n, err := countUserTurns(path); err == nil {
+			rec.MessageCount = n
+		}
+	}
+
 	return rec, nil
+}
+
+// countUserTurns streams the jsonl file and counts lines whose `type` field
+// equals "user" — i.e. user-authored conversation turns. Cheap (~50ms for a
+// 50MB file). Returns 0 + error when the file can't be opened.
+func countUserTurns(path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), 1<<22) // 4MB max line
+	const needle = `"type":"user"`
+	n := 0
+	for scanner.Scan() {
+		if bytes.Contains(scanner.Bytes(), []byte(needle)) {
+			n++
+		}
+	}
+	return n, scanner.Err()
 }
 
 // AdminWorkdirPrefix mirrors bridge.AdminWorkdirPrefix. Kept as a copy here
@@ -259,6 +291,9 @@ var adminPromptFingerprints = []string{
 	"[GATEWAY_ADMIN_SESSION_v1]", // stable marker — preferred
 	// legacy (pre-marker) — remove after enough time has passed
 	"总结一个 claude-code session",
+	"总结这个 claude-code session", // 旧 admin worker 用 "这个"，跟 "一个" 差一字
+	"30 字内中文总结",                 // admin worker summary task
+	"运行 `tail -n",                 // admin worker scans other session jsonls
 	`jq -r 'select((.type == "user"`,
 	"_skip_meta_",
 }
