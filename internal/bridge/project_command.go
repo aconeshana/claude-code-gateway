@@ -72,11 +72,11 @@ func (b *Bridge) removeManualProject(userID, path string) {
 }
 
 // newSessionInDir creates a session in the given project dir, triggered
-// from the /project card's [新建 session] button. Uses the same flow as
+// from the /project card's [新建会话] button. Uses the same flow as
 // cmdNew (snapshot focus + create + afterCreateOrActivate).
 func (b *Bridge) newSessionInDir(ctx context.Context, m channel.InboundMessage, dir string) {
 	if dir == "" {
-		b.replyOrText(ctx, m, "目录为空,无法创建 session")
+		b.replyOrText(ctx, m, "目录为空,无法新建会话")
 		return
 	}
 	priorFocus := b.snapshotFocus(m.UserID)
@@ -89,7 +89,7 @@ func (b *Bridge) newSessionInDir(ctx context.Context, m channel.InboundMessage, 
 		Origin:      channelKindToOrigin(m.ChannelKind),
 	})
 	if err != nil {
-		b.replyOrText(ctx, m, "创建 session 失败: "+err.Error())
+		b.replyOrText(ctx, m, "新建会话失败: "+err.Error())
 		return
 	}
 	b.ensureSubscribed(ctx, sess, m)
@@ -103,14 +103,14 @@ func (b *Bridge) newSessionInDir(ctx context.Context, m channel.InboundMessage, 
 		body = fmt.Sprintf("%s · %s · 已创建 · 进入话题发送消息", display, sid)
 	}
 	msgID, cerr := b.replyCard(ctx, m, channel.Card{
-		Title:    "Session Created",
+		Title:    "📂 " + display,
 		Tone:     channel.ToneSuccess,
 		Sections: []channel.Section{{Markdown: body}},
 	})
 	if cerr != nil {
 		return
 	}
-	welcome := fmt.Sprintf("👋 进入话题 [`%s`] · %s\n在这里直接发消息,bot 会路由到该 session。", sid, display)
+	welcome := fmt.Sprintf("👋 话题 [`%s`] · %s 已创建\n\n在当前对话框继续沟通", sid, display)
 	b.afterCreateOrActivate(ctx, sess, m.UserID, msgID, welcome, priorFocus, false)
 }
 
@@ -134,6 +134,24 @@ func (b *Bridge) buildProjectsCard(userID string) channel.Card {
 		focusedDir = sess.Info().WorkingDir
 	}
 
+	// Aggregate per-project session counts (total visible + active) so each
+	// row carries the same info /list used to show — merged view is the
+	// single canonical project picker.
+	visible := b.filterAliveSessions(b.mgr.ListDiscoverableByOwner(userID, b.shareExternalEnabled()))
+	type projAgg struct{ Total, Active int }
+	agg := map[string]*projAgg{}
+	for _, info := range visible {
+		a := agg[info.WorkingDir]
+		if a == nil {
+			a = &projAgg{}
+			agg[info.WorkingDir] = a
+		}
+		a.Total++
+		if info.Status == string(session.StatusActive) {
+			a.Active++
+		}
+	}
+
 	sections := make([]channel.Section, 0, len(projects)+2)
 	if len(projects) == 0 {
 		sections = append(sections, channel.Section{
@@ -146,50 +164,48 @@ func (b *Bridge) buildProjectsCard(userID string) channel.Card {
 			if p == focusedDir {
 				marker = " ★"
 			}
-			n := b.countSessionsInProject(userID, p)
-			body := fmt.Sprintf("**%s**%s · `%s` · %d sessions", name, marker, p, n)
+			total, active := 0, 0
+			if a := agg[p]; a != nil {
+				total, active = a.Total, a.Active
+			}
+			body := fmt.Sprintf("**%s**%s · `%s` · %d 个会话 · %d 个活跃",
+				name, marker, p, total, active)
 			sections = append(sections, channel.Section{
 				Markdown: body,
 				Buttons: []channel.Button{
 					{Label: "进入", Style: "primary",
 						Action: map[string]string{"action": "show_project", "working_dir": p, "return_to": "projects"}},
-					{Label: "新建 session", Style: "default",
+					{Label: "新建会话", Style: "default",
 						Action: map[string]string{"action": "new_session_in", "working_dir": p}},
 				},
 			})
 		}
 	}
-	sections = append(sections, channel.Section{Divider: true})
-	sections = append(sections, channel.Section{
-		Buttons: []channel.Button{{
-			Label: "➕ 添加项目", Style: "primary",
-			Action: map[string]string{
-				"action":  "pick_dir",
-				"path":    homeDir(),
-				"purpose": "add_project",
-			},
-		}},
-	})
+
+	// Footer: [➕ 添加项目][归档对话 (N)] — combines /project's add-project
+	// entry with /list's archive entry into a single row.
+	footer := []channel.Button{{
+		Label: "➕ 添加项目", Style: "primary",
+		Action: map[string]string{
+			"action":  "pick_dir",
+			"path":    homeDir(),
+			"purpose": "add_project",
+		},
+	}}
+	if archived := b.filterAliveSessions(b.mgr.ListArchivedByOwner(userID)); len(archived) > 0 {
+		footer = append(footer, channel.Button{
+			Label:  fmt.Sprintf("归档对话 (%d)", len(archived)),
+			Style:  "default",
+			Action: map[string]string{"action": "show_archived"},
+		})
+	}
+	sections = append(sections, channel.Section{Divider: true, Buttons: footer})
+
 	return channel.Card{
 		Title:    "Projects",
 		Tone:     channel.ToneInfo,
 		Sections: sections,
 	}
-}
-
-func (b *Bridge) countSessionsInProject(userID, dir string) int {
-	// Use the same source-of-truth as buildProjectCard so the count
-	// matches what the drill-in actually shows (otherwise external/shared
-	// sessions get displayed inside but counted as 0 outside).
-	visible := b.filterAliveSessions(b.mgr.ListDiscoverableByOwner(userID, b.shareExternalEnabled()))
-	n := 0
-	for _, info := range visible {
-		if info.WorkingDir == dir &&
-			(info.Status == string(session.StatusActive) || info.Status == string(session.StatusIdle)) {
-			n++
-		}
-	}
-	return n
 }
 
 // --- pick_dir card action: directory picker ---
@@ -399,6 +415,7 @@ func homeDir() string {
 //   - add_project → back to the /project list
 //   - setup_cwd / others (none yet) → no return (the picker is the whole
 //     flow; users dismiss it by walking away)
+//
 // Returns nil when no return action makes sense.
 func pickDirReturnButton(purpose string) *channel.Button {
 	switch purpose {

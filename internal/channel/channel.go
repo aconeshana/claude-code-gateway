@@ -179,6 +179,14 @@ type Section struct {
 	Form     *Form
 	Note     string
 	Divider  bool
+
+	// ButtonLayout controls how multiple Buttons render on supported channels:
+	//   ""         → stacked / default (cluster left)
+	//   "fill"     → column_set with equal-width buttons spanning the card
+	//   "trailing" → Markdown on the left, single button right-aligned (the
+	//                section must have exactly one button to use this layout)
+	// Channels that don't support advanced layouts fall back to default.
+	ButtonLayout string
 }
 
 // Button represents an interactive action in a card.
@@ -193,6 +201,19 @@ type Form struct {
 	FormID string
 	Fields []FormField
 	Submit Button
+
+	// LeadingButtons are non-submit buttons rendered alongside the form's
+	// input/submit row (e.g. a [详情] button next to an [输入框][执行] pair).
+	// On Lark this is implemented by wrapping the form contents in a
+	// column_set so the buttons sit inline with the input. Channels that
+	// don't support inline layouts fall back to stacking them above the input.
+	LeadingButtons []Button
+
+	// SecondaryButtons are non-submit buttons rendered alongside the submit
+	// button (e.g. [取消] next to [保存]). On Lark they go into the same
+	// column_set as Submit, all width=auto, horizontally aligned left.
+	// Channels without inline support fall back to stacking them below.
+	SecondaryButtons []Button
 }
 
 type FormField struct {

@@ -17,6 +17,7 @@ import (
 
 	"github.com/anthropics/claude-code-gateway/internal/channel"
 	"github.com/anthropics/claude-code-gateway/internal/channel/feishu"
+	"github.com/anthropics/claude-code-gateway/internal/cron"
 	"github.com/anthropics/claude-code-gateway/internal/plan"
 	"github.com/anthropics/claude-code-gateway/internal/runtime"
 	claudeRT "github.com/anthropics/claude-code-gateway/internal/runtime/claude"
@@ -27,9 +28,9 @@ import (
 // Options carries everything Bridge needs to operate. Required fields:
 // Manager, Channel, DefaultCWD. The rest have sensible defaults.
 type Options struct {
-	Manager     *session.Manager
-	Channel     channel.Channel
-	DefaultCWD  string
+	Manager    *session.Manager
+	Channel    channel.Channel
+	DefaultCWD string
 
 	// EnvFilePath enables persistent /config changes. Empty disables.
 	EnvFilePath string
@@ -72,6 +73,12 @@ type Options struct {
 	// ApplyCLIPath, when set, is invoked when CLAUDE_CLI_PATH changes so the
 	// runtime spawns the new binary on subsequent Create calls.
 	ApplyCLIPath func(path string)
+
+	// CronStore, when non-nil, enables cron job management.
+	CronStore cron.Store
+
+	// CronRunLog, when non-nil, provides run history for cron jobs.
+	CronRunLog *cron.RunLog
 }
 
 // Bridge wires together a channel.Channel and a session.Manager.
@@ -96,6 +103,10 @@ type Bridge struct {
 
 	applyAllowedUsers func(ids []string)
 	applyCLIPath      func(path string)
+
+	cronStore     cron.Store
+	cronRunLog    *cron.RunLog
+	cronScheduler *cron.Scheduler
 
 	mu                  sync.Mutex
 	subscribed          map[string]bool
@@ -154,6 +165,8 @@ func New(opts Options) *Bridge {
 		b.admin = newAdmin(opts.Manager, opts.DefaultCWD, opts.AdminModel)
 		b.worker = newSummaryWorker(opts.Manager, b.admin, opts.Persister)
 	}
+	b.cronStore = opts.CronStore
+	b.cronRunLog = opts.CronRunLog
 	b.registerCommands()
 	return b
 }
@@ -174,6 +187,12 @@ func (b *Bridge) Start(ctx context.Context) {
 	}
 	if b.worker != nil {
 		go b.worker.Run(ctx)
+	}
+	if b.cronStore != nil {
+		exec := newBridgeExecutor(b.mgr, b.defaultCWD)
+		b.cronScheduler = cron.NewScheduler(b.cronStore, exec, b.cronRunLog, b.cronResultNotifier())
+		go b.cronScheduler.Start(ctx)
+		log.Printf("[bridge] cron scheduler started")
 	}
 	b.startDiscoveryLoop(ctx)
 }
@@ -342,7 +361,7 @@ func (b *Bridge) resolveOrCreateSession(ctx context.Context, m channel.InboundMe
 				Origin:      channelKindToOrigin(m.ChannelKind),
 			})
 			if err != nil {
-				b.replyText(ctx, m, "新建 session 失败: "+err.Error())
+				b.replyText(ctx, m, "新建会话失败: "+err.Error())
 				return nil, false
 			}
 			target = sess
@@ -603,6 +622,20 @@ func (b *Bridge) openThreadForSession(ctx context.Context, sess *session.Session
 	if info.ThreadID != "" && info.RootMessageID != "" {
 		// Reuse: reply into the existing thread. Lark will update the main
 		// chat's 话题入口卡 with a "new reply" badge so the user notices.
+		// Also patch the anchor card title so old "Session Created" entries
+		// in the thread list get the project-name format.
+		display := info.Label
+		if display == "" {
+			display = projectName(sess.WorkingDir)
+		}
+		anchorCard := channel.Card{
+			Title:    "📂 " + display,
+			Tone:     channel.ToneInfo,
+			Sections: []channel.Section{{Markdown: renderSessionHeader(info, "") + "\n" + renderSessionTitle(info)}},
+		}
+		if err := b.ch.UpdateMessage(ctx, info.RootMessageID, channel.OutboundMessage{Card: &anchorCard}); err != nil {
+			log.Printf("[bridge] openThreadForSession: update anchor card title failed (non-fatal): %v", err)
+		}
 		_, err := b.ch.SendMessage(ctx, channel.OutboundMessage{
 			ChatID:           info.ChatID,
 			Text:             welcome,
@@ -656,6 +689,23 @@ func (b *Bridge) hasMainChatFocus(ownerID string) bool {
 	return focused.Info().Status == string(session.StatusActive)
 }
 
+// currentSession returns the session that "operate on the current
+// conversation" commands (/rename /stop /terminate /archive no-arg, etc.)
+// should target, following V2 routing rules:
+//   - in a thread → the thread-bound session (so /rename inside a thread
+//     names that session, not whatever the main-chat focus happens to be)
+//   - in main chat → the focused session
+//
+// Returns (nil, false) when nothing is active in this context.
+func (b *Bridge) currentSession(m channel.InboundMessage) (*session.Session, bool) {
+	if m.ThreadID != "" {
+		if sess, ok := b.mgr.GetByThreadID(m.ThreadID); ok {
+			return sess, true
+		}
+	}
+	return b.mgr.FocusedSession(m.UserID)
+}
+
 // snapshotFocus captures the active main-chat focus BEFORE a /new /resume
 // /branch creates or reactivates a session. Callers must capture this
 // upfront because mgr.Create / mgr.Reactivate eagerly SetFocus to the new
@@ -683,7 +733,18 @@ func (b *Bridge) snapshotFocus(ownerID string) *session.Session {
 // fork is meant to be parallel, never the main-chat focus).
 func (b *Bridge) afterCreateOrActivate(ctx context.Context, newSess *session.Session, ownerID, anchorMsgID, welcome string, priorFocus *session.Session, forceThread bool) {
 	if priorFocus == nil && !forceThread {
-		// newSess keeps focus (already SetFocus'd by mgr.Create / Reactivate).
+		// V2 TOP principle: reuse existing thread outranks taking main-chat
+		// focus. If newSess already carries a thread binding (preserved
+		// across idle/restart by Reactivate), route into that thread —
+		// don't silently hijack main-chat focus.
+		if info := newSess.Info(); info.ThreadID != "" {
+			b.mgr.ClearFocus(ownerID)
+			if err := b.openThreadForSession(ctx, newSess, anchorMsgID, welcome); err != nil {
+				log.Printf("[bridge] preserve-thread on resume %s failed: %v", displaySessionID(newSess), err)
+			}
+		}
+		// else: newSess keeps the focus already set by mgr.Create / Reactivate
+		// (default container = main chat, principle #2).
 		b.saveStateIfPossible()
 		return
 	}

@@ -103,8 +103,9 @@ func TestBridge_ListEmpty(t *testing.T) {
 	if len(out) != 1 {
 		t.Fatalf("Outbound = %d, want 1", len(out))
 	}
-	if !strings.Contains(out[0].Card.Sections[0].Markdown, "暂无 session") {
-		t.Errorf("empty list message missing: %+v", out[0].Card.Sections)
+	// Merged with /project: empty state shows the projects picker placeholder.
+	if !strings.Contains(out[0].Card.Sections[0].Markdown, "暂无项目") {
+		t.Errorf("empty projects card missing: %+v", out[0].Card.Sections)
 	}
 }
 
@@ -162,6 +163,85 @@ func TestBridge_SwitchSessionByPrefix(t *testing.T) {
 	focused, _ := mgr.FocusedSession("alice")
 	if focused.ID != s2.ID {
 		t.Errorf("focused = %s, want %s", focused.ID, s2.ID)
+	}
+}
+
+func TestBridge_ResumeWithExistingThreadDoesNotTakeFocus(t *testing.T) {
+	// V2 top principle: reuse existing thread > take main-chat focus.
+	// When a thread-bound session is resumed with no priorFocus, it should
+	// route into its existing thread (welcome there) and leave main-chat
+	// focus empty — instead of silently hijacking main chat.
+	b, _, mgr := newTestBridge(t)
+	sess, _ := mgr.Create(context.Background(), session.CreateOpts{OwnerID: "alice", Label: "threaded"})
+	waitForCLIID(t, sess, 1*time.Second)
+	// Pretend this session was bound to a thread before the user terminated it.
+	_ = mgr.BindThread(sess.ID, "omt_existing", "om_root")
+	mgr.TransitionToIdle(sess.ID)
+	// Precondition: no focus.
+	if _, ok := mgr.FocusedSession("alice"); ok {
+		t.Fatal("precondition failed: expected no focus before resume")
+	}
+
+	// Trigger [恢复] via card action.
+	b.OnMessage(context.Background(), channel.InboundMessage{
+		UserID: "alice", ChatID: "c1", Kind: channel.InputCardAction,
+		MessageID: "om_list_card",
+		Action: &channel.CardAction{
+			Name:   "resume_session",
+			Values: map[string]interface{}{"session_id": sess.ID},
+		},
+	})
+
+	// Give the async resume goroutine time to complete. Wait for the manager
+	// to host an Active session (not Idle) — ListActiveByOwner is misnamed
+	// and includes Idle, so check StatusActive explicitly.
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		hasActive := false
+		for _, info := range mgr.ListActiveByOwner("alice") {
+			if info.Status == string(session.StatusActive) {
+				hasActive = true
+				break
+			}
+		}
+		if hasActive {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if active := mgr.ListActiveByOwner("alice"); len(active) != 1 {
+		t.Fatalf("expected 1 active session after resume, got %d", len(active))
+	}
+	// Key assertion: focus must NOT have been auto-taken since sess has a thread.
+	if focused, ok := mgr.FocusedSession("alice"); ok {
+		t.Errorf("expected no main-chat focus (sess has thread), got focused=%s", focused.ID)
+	}
+}
+
+func TestBridge_SwitchToIdleSessionFallsBackToResume(t *testing.T) {
+	// BUG-7: /switch on an idle prefix used to reject with "请用 /resume",
+	// forcing the user to retry. It should auto-resume instead — same outcome
+	// as the [恢复] button.
+	b, _, mgr := newTestBridge(t)
+	sess, _ := mgr.Create(context.Background(), session.CreateOpts{OwnerID: "alice", Label: "stale"})
+	waitForCLIID(t, sess, 1*time.Second)
+	// Drop to idle (simulate /terminate).
+	mgr.TransitionToIdle(sess.ID)
+
+	b.OnMessage(context.Background(), channel.InboundMessage{
+		UserID: "alice", ChatID: "c1", Kind: channel.InputText, Text: "/switch stale",
+	})
+
+	// After reactivation a new manager-internal session exists in active list
+	// for alice; she should have exactly one active.
+	active := mgr.ListActiveByOwner("alice")
+	if len(active) != 1 {
+		t.Fatalf("active sessions = %d, want 1 (auto-resume), got %+v", len(active), active)
+	}
+	focused, ok := mgr.FocusedSession("alice")
+	if !ok || focused.ID != active[0].ID {
+		t.Errorf("expected focus on reactivated session, got focus=%v", focused)
 	}
 }
 

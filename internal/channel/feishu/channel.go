@@ -721,7 +721,7 @@ func extractTextContent(contentJSON string) string {
 //     {"zh_cn":{"title":"...","content":[[...]]}}
 //  2. Already-unwrapped (the SDK strips the locale layer for us):
 //     {"title":"...","content":[[{"tag":"text","text":"...","style":[]},
-//                                {"tag":"img","image_key":"..."}]]}
+//     {"tag":"img","image_key":"..."}]]}
 //
 // We try shape 2 first (what the Lark Go SDK actually delivers in practice)
 // and fall back to shape 1. Tag schema within a row:

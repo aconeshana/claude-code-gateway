@@ -33,23 +33,23 @@ type CreateOpts struct {
 	// this when they have already parsed an opaque runtime payload.
 	RuntimeConfig runtime.Config
 
-	Thinking                        string
-	Effort                          string
-	MaxBudgetUSD                    float64
-	TaskBudget                      float64
-	Agent                           string
-	Betas                           []string
-	JSONSchema                      string
-	AllowedTools                    []string
-	DisallowedTools                 []string
-	Tools                           []string
-	MCPConfig                       string
-	FallbackModel                   string
-	SessionID                       string
+	Thinking        string
+	Effort          string
+	MaxBudgetUSD    float64
+	TaskBudget      float64
+	Agent           string
+	Betas           []string
+	JSONSchema      string
+	AllowedTools    []string
+	DisallowedTools []string
+	Tools           []string
+	MCPConfig       string
+	FallbackModel   string
+	SessionID       string
 	// ResumeID, when set, passes --resume <id> to the CLI at spawn time.
 	// Used with ForkSession to create a branch of an existing session.
-	ResumeID    string
-	ForkSession string
+	ResumeID                        string
+	ForkSession                     string
 	AddDirs                         []string
 	Channels                        []string
 	IncludeHookEvents               bool
@@ -130,6 +130,8 @@ type SummaryStore interface {
 	RecordExternalSummary(cliSessionID string, aug ExternalAugmentation)
 	CountFreshExternalSummaries(minVersion int) int
 	CountSkippedExternalSummaries(minVersion int) int
+	CountFreshExternalSummariesIn(minVersion int, cliIDs map[string]bool) int
+	CountSkippedExternalSummariesIn(minVersion int, cliIDs map[string]bool) int
 	PurgeExternalSummaries(pred func(cliID string, aug ExternalAugmentation) bool) int
 }
 
@@ -272,6 +274,33 @@ func (m *Manager) CountSkippedExternalSummaries(minVersion int) int {
 		return 0
 	}
 	return store.CountSkippedExternalSummaries(minVersion)
+}
+
+// CountFreshExternalSummariesIn is the scoped version of
+// CountFreshExternalSummaries — only counts records whose CLI session id is
+// in cliIDs. Used by /status so the percentage stays bounded by the current
+// discoverable inventory (historical records for claimed/archived sessions
+// are excluded).
+func (m *Manager) CountFreshExternalSummariesIn(minVersion int, cliIDs map[string]bool) int {
+	m.mu.RLock()
+	store := m.summaryStore
+	m.mu.RUnlock()
+	if store == nil {
+		return 0
+	}
+	return store.CountFreshExternalSummariesIn(minVersion, cliIDs)
+}
+
+// CountSkippedExternalSummariesIn is the scoped variant of
+// CountSkippedExternalSummaries (see CountFreshExternalSummariesIn).
+func (m *Manager) CountSkippedExternalSummariesIn(minVersion int, cliIDs map[string]bool) int {
+	m.mu.RLock()
+	store := m.summaryStore
+	m.mu.RUnlock()
+	if store == nil {
+		return 0
+	}
+	return store.CountSkippedExternalSummariesIn(minVersion, cliIDs)
 }
 
 // PurgeExternalSummaries clears persisted augmentations matching pred.

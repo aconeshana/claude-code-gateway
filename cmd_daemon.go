@@ -19,11 +19,11 @@ import (
 )
 
 const (
-	pidFileName        = "gateway.pid"
-	preferredLogFile   = "/var/log/ccg.log"
-	readyTimeout       = 120 * time.Second
-	readyPollInterval  = 2 * time.Second
-	stopGraceTimeout   = 10 * time.Second
+	pidFileName       = "gateway.pid"
+	preferredLogFile  = "/var/log/ccg.log"
+	readyTimeout      = 120 * time.Second
+	readyPollInterval = 2 * time.Second
+	stopGraceTimeout  = 10 * time.Second
 )
 
 // ccgDir returns ~/.ccg and ensures the directory exists.

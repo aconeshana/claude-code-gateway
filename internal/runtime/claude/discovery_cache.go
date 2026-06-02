@@ -25,8 +25,8 @@ import (
 const cacheSchemaVersion = 3
 
 type cachePayload struct {
-	Version int                    `json:"version"`
-	Entries map[string]cacheEntry  `json:"entries"`
+	Version int                   `json:"version"`
+	Entries map[string]cacheEntry `json:"entries"`
 }
 
 // MTimeCache memoizes parsed DiscoveredSession records keyed by jsonl path.
