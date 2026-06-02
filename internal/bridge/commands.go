@@ -120,10 +120,22 @@ func (b *Bridge) registerCommands() {
 			Handler: b.wrapNoArgs(b.cmdStatus),
 		},
 		{
+			Name:    "/skills",
+			Usage:   "/skills",
+			Desc:    "列出可用 skills(项目 + 全局 .claude/skills/)",
+			Handler: b.wrapNoArgs(b.cmdSkills),
+		},
+		{
 			Name:    "/help",
 			Usage:   "/help",
 			Desc:    "显示此帮助",
 			Handler: b.wrapNoArgs(b.cmdHelp),
+		},
+		{
+			Name:    "/cron",
+			Usage:   "/cron [list|add|remove|enable|disable|history]",
+			Desc:    "管理定时任务(无参数显示管理卡片)",
+			Handler: b.cmdCron,
 		},
 	}
 }
@@ -195,7 +207,7 @@ func (b *Bridge) cmdNew(ctx context.Context, m channel.InboundMessage, args stri
 	sid := displaySessionID(sess)
 	body := fmt.Sprintf("%s · %s · 已创建 · 进入话题发送消息", display, sid)
 	msgID, err := b.replyCard(ctx, m, channel.Card{
-		Title:    "Session Created",
+		Title:    "📂 " + display,
 		Tone:     channel.ToneSuccess,
 		Sections: []channel.Section{{Markdown: body}},
 	})
@@ -203,127 +215,34 @@ func (b *Bridge) cmdNew(ctx context.Context, m channel.InboundMessage, args stri
 		log.Printf("[bridge] cmdNew: response card send failed: %v", err)
 		return
 	}
-	welcome := fmt.Sprintf("👋 进入话题 [`%s`] · %s\n在这里直接发消息,bot 会路由到该 session。", sid, display)
+	welcome := fmt.Sprintf("👋 话题 [`%s`] · %s 已创建\n\n在当前对话框继续沟通", sid, display)
 	b.afterCreateOrActivate(ctx, sess, m.UserID, msgID, welcome, priorFocus, false)
 }
 
-// --- /list (two-level menu: projects → sessions) ---
+// --- /list (alias for /project — single canonical project picker) ---
+//
+// /list and /project both render the same merged Projects card via
+// buildProjectsCard. The card includes:
+//   - one section per project (with focus marker + session counts)
+//   - per-project [进入][新建会话] buttons
+//   - footer [➕ 添加项目][归档对话 (N)] entries
+//
+// Card-action drill-in flows (show_project / back_to_list / show_projects)
+// all route back to this same card so the user stays inside one Reply chain.
 
 func (b *Bridge) cmdList(ctx context.Context, m channel.InboundMessage) {
-	card, empty := b.buildListCard(m.UserID)
-	if empty {
-		b.replyCard(ctx, m, channel.Card{
-			Title:    "Sessions",
-			Tone:     channel.ToneInfo,
-			Sections: []channel.Section{{Markdown: "暂无 session,发送消息或使用 `/new` 创建"}},
-		})
-		return
-	}
-	b.replyCard(ctx, m, card)
+	b.cmdProject(ctx, m)
 }
 
-// buildListCard renders the top-level /list view (project grouping). Reused
-// by the card-action handlers below so the user's drill-in / resume flow
-// stays inside a single card via Reply — saving chat real estate compared
-// to posting a new card for every step.
-func (b *Bridge) buildListCard(userID string) (channel.Card, bool) {
-	visible := b.filterAliveSessions(b.mgr.ListDiscoverableByOwner(userID, b.shareExternalEnabled()))
-	archived := b.filterAliveSessions(b.mgr.ListArchivedByOwner(userID))
-	if len(visible) == 0 && len(archived) == 0 {
-		return channel.Card{}, true
-	}
-	var focusedID string
-	if sess, ok := b.mgr.FocusedSession(userID); ok {
-		focusedID = sess.ID
-	}
-	sections := buildProjectListSections(visible, archived, focusedID)
-	return channel.Card{
-		Title:    "Sessions · 按项目分组",
-		Tone:     channel.ToneInfo,
-		Sections: sections,
-	}, false
-}
-
-// replyWithListCard re-renders the top-level project list via Reply (edits
+// replyWithProjectsCard re-renders the merged projects card via Reply (edits
 // the original card in place) — used by "← 返回" buttons in drill-in views.
-func (b *Bridge) replyWithListCard(ctx context.Context, m channel.InboundMessage) {
-	card, empty := b.buildListCard(m.UserID)
-	if empty {
-		b.replyOrText(ctx, m, "暂无 session,发送消息或使用 `/new` 创建")
-		return
-	}
+func (b *Bridge) replyWithProjectsCard(ctx context.Context, m channel.InboundMessage) {
+	card := b.buildProjectsCard(m.UserID)
 	if m.Reply != nil {
 		m.Reply(card)
 		return
 	}
 	b.replyCard(ctx, m, card)
-}
-
-// buildProjectListSections groups sessions by their WorkingDir and renders one
-// section per project. Each section is expandable via the show_project card
-// action (drills into per-session view).
-func buildProjectListSections(visible, archived []session.SessionInfo, focusedID string) []channel.Section {
-	type projAgg struct {
-		WorkingDir string
-		Sessions   []session.SessionInfo
-		Active     int
-		HasFocused bool
-	}
-	groups := make(map[string]*projAgg)
-	order := []string{}
-	for _, info := range visible {
-		dir := info.WorkingDir
-		if dir == "" {
-			dir = "(unknown)"
-		}
-		g, ok := groups[dir]
-		if !ok {
-			g = &projAgg{WorkingDir: dir}
-			groups[dir] = g
-			order = append(order, dir)
-		}
-		g.Sessions = append(g.Sessions, info)
-		if info.Status == string(session.StatusActive) {
-			g.Active++
-		}
-		if info.ID == focusedID {
-			g.HasFocused = true
-		}
-	}
-
-	sections := make([]channel.Section, 0, len(order)+1)
-	for _, dir := range order {
-		g := groups[dir]
-		focusMark := ""
-		if g.HasFocused {
-			focusMark = " ★"
-		}
-		line := fmt.Sprintf("**%s** · %d sessions · %d active%s",
-			projectName(dir), len(g.Sessions), g.Active, focusMark)
-		sections = append(sections, channel.Section{
-			Markdown: line,
-			Buttons: []channel.Button{{
-				Label: "展开", Style: "primary",
-				Action: map[string]string{"action": "show_project", "working_dir": dir},
-			}},
-		})
-	}
-
-	if len(visible) == 0 {
-		sections = append(sections, channel.Section{Markdown: "暂无活跃 session"})
-	}
-
-	if len(archived) > 0 {
-		sections = append(sections, channel.Section{
-			Divider: true,
-			Buttons: []channel.Button{{
-				Label:  fmt.Sprintf("归档对话 (%d)", len(archived)),
-				Style:  "default",
-				Action: map[string]string{"action": "show_archived"},
-			}},
-		})
-	}
-	return sections
 }
 
 // buildArchivedSections renders archived sessions with resume/delete buttons.
@@ -404,7 +323,7 @@ func buildSessionListSections(sessions []session.SessionInfo, focusedID string) 
 			Label: "刷新摘要", Style: "default",
 			Action: map[string]string{"action": "refresh_summary", "session_id": sessionPayloadID(info)},
 		})
-		sections = append(sections, channel.Section{Markdown: md, Buttons: btns})
+		sections = append(sections, channel.Section{Markdown: md, Buttons: btns, ButtonLayout: "fill"})
 	}
 	return sections
 }
@@ -419,7 +338,8 @@ func buildArchivedSectionsWithDir(archived []session.SessionInfo, dir string) []
 		body := renderSessionTitle(info)
 		md := header + "\n" + body
 		sections = append(sections, channel.Section{
-			Markdown: md,
+			Markdown:     md,
+			ButtonLayout: "fill",
 			Buttons: []channel.Button{
 				{Label: "恢复", Style: "primary", Action: map[string]string{"action": "resume_archived", "session_id": sessionPayloadID(info), "working_dir": dir}},
 				{Label: "删除", Style: "danger", Action: map[string]string{"action": "remove_archived", "session_id": sessionPayloadID(info), "working_dir": dir}},
@@ -468,11 +388,10 @@ func buildSessionListSectionsWithDir(sessions []session.SessionInfo, focusedID s
 			Label: "重命名", Style: "default",
 			Action: map[string]string{"action": "rename_session", "session_id": sessionPayloadID(info), "working_dir": dir},
 		})
-		sections = append(sections, channel.Section{Markdown: md, Buttons: btns})
+		sections = append(sections, channel.Section{Markdown: md, Buttons: btns, ButtonLayout: "fill"})
 	}
 	return sections
 }
-
 
 // focusedID may be empty (e.g. archive view); when set, the focused session
 // gets a ★ marker.
@@ -533,6 +452,22 @@ func renderSessionTitle(info session.SessionInfo) string {
 	}
 }
 
+// buildResumeWelcome constructs the first message sent into a thread when a
+// session is resumed. Includes the session summary so the user knows what
+// was being worked on without opening the full history.
+func buildResumeWelcome(info session.SessionInfo, display string) string {
+	sid := shortID(info.CLISessionID)
+	if sid == "" {
+		sid = shortID(info.ID)
+	}
+	footer := fmt.Sprintf("👋 话题 [`%s`] · %s 已恢复\n\n在当前对话框继续沟通", sid, display)
+	summary := renderSessionTitle(info)
+	if summary != "" && summary != "_(短对话,无摘要)_" {
+		return "📝 " + summary + "\n\n" + footer
+	}
+	return footer
+}
+
 func parseRFC3339(s string) time.Time {
 	if s == "" {
 		return time.Time{}
@@ -567,7 +502,40 @@ func (b *Bridge) cmdSwitch(ctx context.Context, m channel.InboundMessage, args s
 		b.replyText(ctx, m, err.Error())
 		return
 	}
+	// V2: /switch on an idle target auto-resumes — same outcome as the
+	// [恢复] button. Avoids the previous "请用 /resume" round-trip.
+	if sess.Info().Status != string(session.StatusActive) {
+		b.resumeSessionFlow(ctx, m, sess, "")
+		return
+	}
 	b.switchFocusTo(ctx, m, sess)
+}
+
+// resumeSessionFlow runs the synchronous V2 resume sequence: ClaimExternal
+// if needed, snapshot prior focus, Reactivate, then sendResumedCardAndOpenThread.
+// Shared between cmdSwitch (idle fallback) and the [恢复] card button (the
+// latter wraps this in a goroutine + placeholder card for Lark's 3s callback
+// timeout — see resume_session action handler).
+//
+// editMsgID, when non-empty, makes the "Session Resumed" card replace that
+// message in place (used by the [恢复] card action to update its placeholder
+// instead of posting a 2nd card).
+func (b *Bridge) resumeSessionFlow(ctx context.Context, m channel.InboundMessage, sess *session.Session, editMsgID string) {
+	info := sess.Info()
+	if info.Origin == session.OriginExternal && info.OwnerID == "" {
+		if err := b.mgr.ClaimExternal(sess.ID, m.UserID, m.ChatID, m.ChannelKind); err != nil {
+			b.replyOrText(ctx, m, "纳管失败: "+err.Error())
+			return
+		}
+	}
+	priorFocus := b.snapshotFocus(m.UserID)
+	newSess, err := b.mgr.Reactivate(ctx, sess.ID)
+	if err != nil {
+		b.replyOrText(ctx, m, "恢复失败: "+err.Error())
+		return
+	}
+	b.ensureSubscribed(ctx, newSess, m)
+	b.sendResumedCardAndOpenThread(ctx, m, newSess, priorFocus, editMsgID)
 }
 
 // switchFocusTo applies the V2 /switch flow to a pre-resolved session: stow
@@ -596,16 +564,16 @@ func (b *Bridge) switchFocusTo(ctx context.Context, m channel.InboundMessage, se
 		if pInfo.ThreadID == "" {
 			// First time stowing — open a new thread anchored at a fresh card.
 			stowSID := displaySessionID(priorFocus)
-			stowBody := fmt.Sprintf("📦 **%s** · %s\n已收纳到话题。点下方话题入口继续聊。", stowSID, priorFocus.Label)
+			stowBody := fmt.Sprintf("**%s** · %s\n已收纳到话题。点下方话题入口继续聊。", stowSID, priorFocus.Label)
 			anchorMsgID, err := b.sendCard(ctx, m.ChatID, channel.Card{
-				Title:    "Session 收纳",
+				Title:    "📦 " + projectName(priorFocus.WorkingDir),
 				Tone:     channel.ToneInfo,
 				Sections: []channel.Section{{Markdown: stowBody}},
 			})
 			if err != nil {
 				log.Printf("[bridge] switchFocusTo: stow card send failed: %v", err)
 			} else {
-				welcome := fmt.Sprintf("📌 [`%s`] · %s\n这里继续聊该 session。", stowSID, priorFocus.Label)
+				welcome := fmt.Sprintf("📌 话题 [`%s`] · %s 已收纳\n\n在当前对话框继续沟通", stowSID, priorFocus.Label)
 				if err := b.openThreadForSession(ctx, priorFocus, anchorMsgID, welcome); err != nil {
 					log.Printf("[bridge] switchFocusTo: stow thread open failed: %v", err)
 				} else {
@@ -764,7 +732,7 @@ func (b *Bridge) cmdArchive(ctx context.Context, m channel.InboundMessage, args 
 	prefix := strings.TrimSpace(args)
 	var sessionID string
 	if prefix == "" {
-		focused, ok := b.mgr.FocusedSession(m.UserID)
+		focused, ok := b.currentSession(m)
 		if !ok {
 			b.replyText(ctx, m, "没有 active session")
 			return
@@ -864,7 +832,7 @@ func (b *Bridge) cmdTerminate(ctx context.Context, m channel.InboundMessage, arg
 func (b *Bridge) resolveActiveTarget(ctx context.Context, m channel.InboundMessage, args, cmd string) (*session.Session, bool) {
 	prefix := strings.TrimSpace(args)
 	if prefix == "" {
-		focused, ok := b.mgr.FocusedSession(m.UserID)
+		focused, ok := b.currentSession(m)
 		if !ok {
 			b.replyText(ctx, m, "没有 focused session。用 "+cmd+" <id前缀> 指定")
 			return nil, false
@@ -958,7 +926,7 @@ func (b *Bridge) cmdResume(ctx context.Context, m channel.InboundMessage, args s
 		return
 	}
 	b.ensureSubscribed(ctx, newSess, m)
-	b.sendResumedCardAndOpenThread(ctx, m, newSess, priorFocus)
+	b.sendResumedCardAndOpenThread(ctx, m, newSess, priorFocus, "")
 }
 
 // sendResumedCardAndOpenThread emits the "Session Resumed" card to the main
@@ -966,28 +934,63 @@ func (b *Bridge) cmdResume(ctx context.Context, m channel.InboundMessage, args s
 // priorFocus + open a thread for the resumed session, or set focus when
 // priorFocus is nil). Shared between cmdResume and the resume_session
 // card-action button.
-func (b *Bridge) sendResumedCardAndOpenThread(ctx context.Context, m channel.InboundMessage, newSess *session.Session, priorFocus *session.Session) {
-	sid := displaySessionID(newSess)
+//
+// editMsgID, when non-empty, identifies a card message to UpdateMessage in
+// place (e.g. the "正在恢复…" placeholder dropped by the [恢复] card action).
+// When empty, a fresh card is posted via replyCard. Either way the resulting
+// message id is used as the thread anchor for afterCreateOrActivate.
+func (b *Bridge) sendResumedCardAndOpenThread(ctx context.Context, m channel.InboundMessage, newSess *session.Session, priorFocus *session.Session, editMsgID string) {
+	info := newSess.Info()
 	display := newSess.Label
 	if display == "" {
 		display = projectName(newSess.WorkingDir)
 	}
-	var body string
-	if priorFocus == nil {
-		body = fmt.Sprintf("%s · %s · 已恢复", display, sid)
+	hasThread := info.ThreadID != ""
+
+	// V2 routing principle: reuse existing thread > use main chat. When sess
+	// has a thread, the full detail (header/summary/welcome) goes INTO that
+	// thread; the main-chat card shrinks to a short ack so the user knows
+	// the click registered. When sess has no thread, the main-chat card is
+	// the only surface and gets the full detail.
+	var resumedCard channel.Card
+	title := "▶ " + display + " · 已恢复"
+	if hasThread {
+		resumedCard = channel.Card{
+			Title:    title,
+			Tone:     channel.ToneSuccess,
+			Sections: []channel.Section{{Markdown: "_详情已发往话题_"}},
+		}
 	} else {
-		body = fmt.Sprintf("%s · %s · 已恢复 · 进入话题发送消息", display, sid)
+		body := renderSessionHeader(info, "") + "\n" + renderSessionTitle(info)
+		if priorFocus != nil {
+			body += "\n_进入话题发送消息_"
+		}
+		resumedCard = channel.Card{
+			Title:    title,
+			Tone:     channel.ToneSuccess,
+			Sections: []channel.Section{{Markdown: body}},
+		}
 	}
-	msgID, cardErr := b.replyCard(ctx, m, channel.Card{
-		Title:    "Session Resumed",
-		Tone:     channel.ToneSuccess,
-		Sections: []channel.Section{{Markdown: body}},
-	})
-	if cardErr != nil {
-		log.Printf("[bridge] sendResumedCardAndOpenThread: response card send failed: %v", cardErr)
-		return
+
+	var msgID string
+	if editMsgID != "" {
+		// In-place update: keeps everything on one message (no extra card).
+		if err := b.ch.UpdateMessage(ctx, editMsgID, channel.OutboundMessage{Card: &resumedCard}); err != nil {
+			log.Printf("[bridge] sendResumedCardAndOpenThread: UpdateMessage %s failed: %v — falling back to new card", shortID(editMsgID), err)
+			editMsgID = ""
+		} else {
+			msgID = editMsgID
+		}
 	}
-	welcome := fmt.Sprintf("👋 进入话题 [`%s`] · %s\n在这里继续聊该 session。", sid, display)
+	if editMsgID == "" {
+		newMsgID, cardErr := b.replyCard(ctx, m, resumedCard)
+		if cardErr != nil {
+			log.Printf("[bridge] sendResumedCardAndOpenThread: response card send failed: %v", cardErr)
+			return
+		}
+		msgID = newMsgID
+	}
+	welcome := buildResumeWelcome(newSess.Info(), display)
 	b.afterCreateOrActivate(ctx, newSess, m.UserID, msgID, welcome, priorFocus, false)
 }
 
@@ -1033,6 +1036,10 @@ func (b *Bridge) cmdHelp(ctx context.Context, m channel.InboundMessage) {
 
 func (b *Bridge) handleCardAction(ctx context.Context, m channel.InboundMessage) {
 	if m.Action == nil {
+		return
+	}
+	// Delegate cron-specific actions first.
+	if b.handleCronCardAction(ctx, m) {
 		return
 	}
 	switch m.Action.Name {
@@ -1101,6 +1108,16 @@ func (b *Bridge) handleCardAction(ctx context.Context, m channel.InboundMessage)
 	case "new_session_in":
 		dir, _ := m.Action.Values["working_dir"].(string)
 		b.newSessionInDir(ctx, m, dir)
+	case "cmd_new":
+		// Top-level "新建会话" button on the /list card — focus-aware:
+		// has focus → create in focus dir + open thread; no focus → projects picker.
+		b.cmdNew(ctx, m, "")
+	case "show_skill":
+		b.showSkillDetail(ctx, m)
+	case "run_skill":
+		b.runSkill(ctx, m)
+	case "back_to_skills":
+		b.replyWithSkillsCard(ctx, m)
 	case "show_project":
 		dir, _ := m.Action.Values["working_dir"].(string)
 		if dir == "" {
@@ -1116,7 +1133,9 @@ func (b *Bridge) handleCardAction(ctx context.Context, m channel.InboundMessage)
 		returnTo, _ := m.Action.Values["return_to"].(string)
 		b.replyWithProjectCard(ctx, m, dir, true, returnTo)
 	case "back_to_list":
-		b.replyWithListCard(ctx, m)
+		// Back-button payloads on cards rendered before the /list and /project
+		// merge still use "back_to_list" — route to the merged projects card.
+		b.replyWithProjectsCard(ctx, m)
 	case "resume_session":
 		id, _ := m.Action.Values["session_id"].(string)
 		if id == "" {
@@ -1127,30 +1146,34 @@ func (b *Bridge) handleCardAction(ctx context.Context, m channel.InboundMessage)
 			b.replyOrText(ctx, m, "session 不存在")
 			return
 		}
-		// Apply the V2 resume flow inline (we can't easily route through
-		// cmdResume because that goes through prefix lookup). Claim external
-		// if needed, snapshot prior focus, reactivate, then run
-		// afterCreateOrActivate via the shared helper.
 		info := sess.Info()
 		if info.Status == string(session.StatusActive) {
 			// Already active — treat the button as a switch.
 			b.switchFocusTo(ctx, m, sess)
 			return
 		}
-		if info.Origin == session.OriginExternal && info.OwnerID == "" {
-			if err := b.mgr.ClaimExternal(sess.ID, m.UserID, m.ChatID, m.ChannelKind); err != nil {
-				b.replyOrText(ctx, m, "纳管失败: "+err.Error())
-				return
-			}
+		// BUG-8: give immediate feedback before the slow Reactivate. Lark's
+		// card-action callback times out at ~3s (would otherwise show
+		// code:100000), and CLI cold start is 10-30s; without a placeholder
+		// the user has no signal that the click registered.
+		if m.Reply != nil {
+			m.Reply(channel.Card{
+				Title: "正在恢复 session " + displaySessionID(sess),
+				Tone:  channel.ToneInfo,
+				Sections: []channel.Section{{
+					Markdown: "CLI 冷启动需 10-30 秒,完成后会在主聊天弹出 Session Resumed 卡片。",
+				}},
+			})
 		}
-		priorFocus := b.snapshotFocus(m.UserID)
-		newSess, err := b.mgr.Reactivate(ctx, sess.ID)
-		if err != nil {
-			b.replyOrText(ctx, m, "恢复失败: "+err.Error())
-			return
-		}
-		b.ensureSubscribed(ctx, newSess, m)
-		b.sendResumedCardAndOpenThread(ctx, m, newSess, priorFocus)
+		// Detach: the handler returns immediately so Lark gets its ack, and the
+		// actual resume + result card happen asynchronously. The placeholder's
+		// message id is reused as the in-place edit target so the final
+		// "Session Resumed" card replaces it (no extra message).
+		mCopy := m
+		editID := m.MessageID
+		go func() {
+			b.resumeSessionFlow(context.Background(), mCopy, sess, editID)
+		}()
 	case "show_plan":
 		if filename, ok := m.Action.Values["filename"].(string); ok {
 			// plan-list embeds thread context into the button payload because
@@ -1525,12 +1548,8 @@ func (b *Bridge) buildProjectCard(userID, dir string, archivedOnly bool, returnT
 		// dead end (新建 + 返回).
 		sections := []channel.Section{
 			{Markdown: fmt.Sprintf("📁 **%s**\n_项目下没有 session_", dir)},
-			{Buttons: []channel.Button{{
-				Label: "+ 新建 session", Style: "primary",
-				Action: map[string]string{"action": "new_session_in", "working_dir": dir},
-			}}},
 		}
-		sections = appendBackButton(sections, backAction, nil)
+		sections = appendNewAndBackButtons(sections, dir, backAction, nil)
 		return channel.Card{
 			Title:    projectName(dir),
 			Tone:     channel.ToneInfo,
@@ -1552,7 +1571,7 @@ func (b *Bridge) buildProjectCard(userID, dir string, archivedOnly bool, returnT
 			}},
 		})
 	}
-	sections = appendBackButton(sections, backAction, nil)
+	sections = appendNewAndBackButtons(sections, dir, backAction, nil)
 	return channel.Card{
 		Title:    projectName(dir),
 		Tone:     channel.ToneInfo,
@@ -1577,6 +1596,24 @@ func appendBackButton(sections []channel.Section, action string, extras map[stri
 	})
 }
 
+// appendNewAndBackButtons suffixes a divider + [+ 新建会话][← 返回] row.
+// dir is the project working_dir for the new-session button; backAction +
+// extras follow the same convention as appendBackButton.
+func appendNewAndBackButtons(sections []channel.Section, dir, backAction string, extras map[string]string) []channel.Section {
+	backPayload := map[string]string{"action": backAction}
+	for k, v := range extras {
+		backPayload[k] = v
+	}
+	return append(sections, channel.Section{
+		Divider: true,
+		Buttons: []channel.Button{
+			{Label: "+ 新建会话", Style: "primary",
+				Action: map[string]string{"action": "new_session_in", "working_dir": dir}},
+			{Label: "← 返回", Style: "default", Action: backPayload},
+		},
+	})
+}
+
 // PendingElicitation captures an outstanding question awaiting a user reply.
 type PendingElicitation struct {
 	SessionID string
@@ -1590,14 +1627,14 @@ type PendingElicitation struct {
 
 // refreshSummaryNow regenerates the summary synchronously and updates the
 // originating card in place. Flow:
-//   1. Lark gets a synchronous Reply (patches the originating card to show
-//      "🔄 刷新中..." — replaces the buttons so the user sees a loading state).
-//   2. After Reply returns, we run admin.query in the SAME goroutine but
-//      with a 30s budget. The card-action HTTP response has already been
-//      sent to Lark via m.Reply, so blocking here is fine.
-//   3. When admin finishes, we rebuild the project / top-level list card
-//      with the new summary and UpdateMessage the originating card id —
-//      the user sees the same card refresh in place, no new chat message.
+//  1. Lark gets a synchronous Reply (patches the originating card to show
+//     "🔄 刷新中..." — replaces the buttons so the user sees a loading state).
+//  2. After Reply returns, we run admin.query in the SAME goroutine but
+//     with a 30s budget. The card-action HTTP response has already been
+//     sent to Lark via m.Reply, so blocking here is fine.
+//  3. When admin finishes, we rebuild the project / top-level list card
+//     with the new summary and UpdateMessage the originating card id —
+//     the user sees the same card refresh in place, no new chat message.
 func (b *Bridge) refreshSummaryNow(ctx context.Context, m channel.InboundMessage, sessionID, dir string) {
 	if b.worker == nil {
 		b.replyOrText(ctx, m, "摘要 worker 未启用,无法刷新")
@@ -1647,7 +1684,9 @@ func (b *Bridge) refreshSummaryNow(ctx context.Context, m channel.InboundMessage
 			returnTo, _ := m.Action.Values["return_to"].(string)
 			newCard, ok = b.buildProjectCard(m.UserID, dir, false, returnTo)
 		} else {
-			newCard, ok = b.buildListCard(m.UserID)
+			// Top-level card (no project context) → merged projects card.
+			newCard = b.buildProjectsCard(m.UserID)
+			ok = true
 		}
 		if !ok || cardMsgID == "" {
 			return
@@ -1718,11 +1757,11 @@ func (b *Bridge) showRenameForm(ctx context.Context, m channel.InboundMessage, s
 						"key":    key,
 					},
 				},
+				SecondaryButtons: []channel.Button{{
+					Label: "取消", Style: "default",
+					Action: map[string]string{"action": "show_project", "working_dir": dir, "return_to": "projects"},
+				}},
 			}},
-			{Buttons: []channel.Button{{
-				Label: "取消", Style: "default",
-				Action: map[string]string{"action": "show_project", "working_dir": dir, "return_to": "projects"},
-			}}},
 		},
 	}
 	if m.Reply != nil {

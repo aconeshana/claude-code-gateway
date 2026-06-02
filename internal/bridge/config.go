@@ -28,18 +28,21 @@ type ConfigField struct {
 // ConfigFields enumerates the settings exposed via /config.
 var ConfigFields = []ConfigField{
 	{EnvKey: "GATEWAY_DEFAULT_CWD", Label: "默认工作目录(主聊天 plain text 兜底)", Default: "~", Mutable: true},
-	{EnvKey: "SUMMARY_INTERVAL", Label: "摘要更新轮数(每 N 条用户消息后重生成,0=关闭)", Mutable: true, Default: "5"},
-	{EnvKey: "ADMIN_MODEL", Label: "管理员 AI 模型", Mutable: true, Default: "claude-haiku-4-5"},
-	{EnvKey: "GATEWAY_SHARE_EXTERNAL_SESSIONS", Label: "共享外部 session(terminal/SDK 等创建的)", Default: "false", Type: "bool", Mutable: true},
-	{EnvKey: "GATEWAY_DISCOVERY_WINDOW_DAYS", Label: "磁盘扫描时间窗口(天,0=全量)", Default: "7", Mutable: true},
-	{EnvKey: "GATEWAY_DISCOVERY_RESCAN_INTERVAL", Label: "重新扫描间隔(如 5m)", Default: "5m", Mutable: true},
-	{EnvKey: "FEISHU_ALLOWED_USER_IDS", Label: "允许的用户 ID(逗号分隔)", Mutable: true},
-	{EnvKey: "FEISHU_APP_ID", Label: "飞书 App ID"},
-	{EnvKey: "FEISHU_APP_SECRET", Label: "飞书 App Secret", Sensitive: true},
-	{EnvKey: "CLAUDE_CLI_PATH", Label: "Claude CLI 路径", Default: "claude", Mutable: true},
 	{EnvKey: "GATEWAY_PERMISSION_MODE", Label: "权限模式", Mutable: true, Default: "auto", Type: "enum", EnumValues: []string{"auto", "forward"}},
+	{EnvKey: "CLAUDE_CLI_PATH", Label: "Claude CLI 路径", Default: "claude", Mutable: true},
 	{EnvKey: "GATEWAY_LISTEN_ADDR", Label: "监听地址", Default: ":8080"},
 	{EnvKey: "GATEWAY_AUTH_TOKEN", Label: "认证 Token", Sensitive: true},
+
+	{EnvKey: "SUMMARY_INTERVAL", Label: "[摘要] 自动更新轮数(每 N 条用户消息后重生成,0=关闭)", Mutable: true, Default: "5"},
+	{EnvKey: "ADMIN_MODEL", Label: "[摘要] 后台模型(生成摘要/语义匹配用)", Mutable: true, Default: "claude-haiku-4-5"},
+
+	{EnvKey: "GATEWAY_SHARE_EXTERNAL_SESSIONS", Label: "[外部会话] 是否纳管(把终端/SDK/IDE 等渠道直接用 Claude CLI 创建的会话展示在 /list 里)", Default: "false", Type: "bool", Mutable: true},
+	{EnvKey: "GATEWAY_DISCOVERY_WINDOW_DAYS", Label: "[外部会话] 扫描时间窗口(天 · 0=全量,只扫近 N 天修改过的 jsonl)", Default: "7", Mutable: true},
+	{EnvKey: "GATEWAY_DISCOVERY_RESCAN_INTERVAL", Label: "[外部会话] 重新扫描间隔(如 5m/1h,定期扫盘发现新会话)", Default: "5m", Mutable: true},
+
+	{EnvKey: "FEISHU_APP_ID", Label: "[飞书] App ID"},
+	{EnvKey: "FEISHU_APP_SECRET", Label: "[飞书] App Secret", Sensitive: true},
+	{EnvKey: "FEISHU_ALLOWED_USER_IDS", Label: "[飞书] 允许的用户 ID(逗号分隔)", Mutable: true},
 }
 
 // FindConfigField looks up a field by env key.

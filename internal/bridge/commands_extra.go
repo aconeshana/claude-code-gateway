@@ -432,20 +432,26 @@ func parseConfigBool(s string) bool {
 }
 
 func buildConfigCard(values map[string]string, envPath string) channel.Card {
-	var sections []channel.Section
-
-	sections = append(sections, channel.Section{Markdown: "**必填配置:**"})
-	for _, field := range ConfigFields {
-		if !field.Required {
-			continue
-		}
-		sections = append(sections, configFieldSection(field, values[field.EnvKey]))
-	}
-	sections = append(sections, channel.Section{Divider: true, Markdown: "**可选配置:**"})
+	var required, optional []ConfigField
 	for _, field := range ConfigFields {
 		if field.Required {
-			continue
+			required = append(required, field)
+		} else {
+			optional = append(optional, field)
 		}
+	}
+
+	var sections []channel.Section
+	// Only render the "必填配置" heading when there's something to put under
+	// it — otherwise the empty heading looks broken to the user.
+	if len(required) > 0 {
+		sections = append(sections, channel.Section{Markdown: "**必填配置:**"})
+		for _, field := range required {
+			sections = append(sections, configFieldSection(field, values[field.EnvKey]))
+		}
+		sections = append(sections, channel.Section{Divider: true, Markdown: "**可选配置:**"})
+	}
+	for _, field := range optional {
 		sections = append(sections, configFieldSection(field, values[field.EnvKey]))
 	}
 	sections = append(sections, channel.Section{
@@ -468,17 +474,17 @@ func configFieldSection(field ConfigField, val string) channel.Section {
 			tag = " · <font color='grey'>需重启</font>"
 		}
 	}
-	status := "✅"
-	if val == "" && field.Required {
-		status = "⚠️"
+	header := fmt.Sprintf("**%s**%s\n`%s` = `%s`", field.Label, tag, field.EnvKey, display)
+	if field.Required {
+		status := "✅"
+		if val == "" {
+			status = "⚠️"
+		}
+		header = fmt.Sprintf("%s **%s**%s\n`%s` = `%s`", status, field.Label, tag, field.EnvKey, display)
 	}
-	header := fmt.Sprintf("%s **%s**%s\n`%s` = `%s`", status, field.Label, tag, field.EnvKey, display)
-	if !field.Required {
-		header = fmt.Sprintf("**%s**%s\n`%s` = `%s`", field.Label, tag, field.EnvKey, display)
-	}
-	style := "primary"
-	if !field.Required {
-		style = "default"
+	style := "default"
+	if field.Required {
+		style = "primary"
 	}
 	return channel.Section{
 		Markdown: header,
@@ -616,7 +622,7 @@ func (b *Bridge) cmdRename(ctx context.Context, m channel.InboundMessage, args s
 		return
 	}
 
-	sess, ok := b.mgr.FocusedSession(m.UserID)
+	sess, ok := b.currentSession(m)
 	if !ok {
 		b.replyText(ctx, m, "没有 active session")
 		return
@@ -702,7 +708,7 @@ func (b *Bridge) cmdBranch(ctx context.Context, m channel.InboundMessage, args s
 	}
 	body := fmt.Sprintf("%s · %s · 已分支自 %s · 进入话题发送消息", display, branchSID, parentSID)
 	msgID, cardErr := b.replyCard(ctx, m, channel.Card{
-		Title:    "Branch Created",
+		Title:    "🌱 " + display,
 		Tone:     channel.ToneSuccess,
 		Sections: []channel.Section{{Markdown: body}},
 	})
@@ -710,7 +716,7 @@ func (b *Bridge) cmdBranch(ctx context.Context, m channel.InboundMessage, args s
 		log.Printf("[bridge] cmdBranch: response card send failed: %v", cardErr)
 		return
 	}
-	welcome := fmt.Sprintf("🌱 进入 branch [`%s`] · %s\n继承自 `%s` 的上下文,在这里继续聊。", branchSID, display, parentSID)
+	welcome := fmt.Sprintf("🌱 话题 [`%s`] · %s 已创建（分支自 `%s`）\n\n在当前对话框继续沟通", branchSID, display, parentSID)
 	// /branch always opens a thread (forceThread=true). priorFocus must be
 	// non-nil here (we've already returned above when ok=false).
 	b.afterCreateOrActivate(ctx, branchSess, m.UserID, msgID, welcome, priorFocus, true)

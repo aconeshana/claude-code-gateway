@@ -356,7 +356,6 @@ func updateContextPctFromAssistant(state *streamState, raw json.RawMessage) {
 	}
 }
 
-
 func buildHUDNote(model, gitBranch string, contextPct int, suffix string) string {
 	var parts []string
 	if model != "" {
