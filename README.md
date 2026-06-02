@@ -1,78 +1,137 @@
 # Claude Code Gateway
 
-Go 网关,把外部客户端(WebSocket 或飞书 IM)桥接到 [Claude Code CLI](https://github.com/anthropics/claude-code) 子进程。每个会话对应一个独立 CLI 进程,通过 stream-json stdin/stdout 双向通信。
+🌐 Language: **English** | [中文](./README.zh-CN.md) | [日本語](./README.ja.md)
 
-完整架构、模块说明、命令、配置见 [CLAUDE.md](./CLAUDE.md)。
-
----
-
-## 运行依赖
-
-| 工具 | 用途 | 必需 | 安装 |
-|------|------|------|------|
-| Go ≥ 1.22 | 编译 / 运行 gateway | 必需 | `brew install go` |
-| `claude` CLI | 实际跑会话的子进程 | 必需 | [安装文档](https://docs.claude.com/en/docs/claude-code) |
-| `jq` | 摘要 worker 解析 jsonl(用预制 jq pipeline 喂给 admin 模型,避免 6-8 个 tool 轮次探索格式) | **推荐** | macOS `brew install jq` / Debian/Ubuntu `apt install jq` |
-| `git` | `/diff` 命令 + 工作目录变更检测 | 可选 | 系统自带 |
-
-**`jq` 缺失会怎样?** 摘要功能依然能用,但 admin 模型每次会花 6-8 个 tool 轮次去 `head/cat/jq with wrong filter` 探索 jsonl 格式,质量和延迟都会显著退化(单次摘要 60-90s vs 装了 jq 的 20-30s)。启动日志会打 warning:
-
-```
-[summary-worker] WARNING: jq not in PATH — summary quality and latency will both regress.
-Install with: brew install jq (macOS) / apt install jq (Debian/Ubuntu)
-```
+A Go gateway that bridges remote clients (WebSocket / Feishu IM) to local [Claude Code CLI](https://github.com/anthropics/claude-code) subprocesses. Each chat session pins a dedicated CLI process and streams JSON over stdin/stdout — so a phone, browser, or chat app can drive a long-running Claude Code conversation on your laptop without losing context.
 
 ---
 
-## 快速开始
+## Quick Start
+
+### Option A — Let Claude Code install it for you (recommended)
+
+If you have `claude` CLI already, paste the following one-liner into it:
+
+```
+请按照这个 QUICK_START.md 帮我部署 Claude Code Gateway，并配置为开机自启守护进程：
+https://github.com/aconeshana/claude-code-gateway/blob/main/QUICK_START.md
+```
+
+Claude Code will clone, build, write the dotenv, register the launch agent / systemd unit, and verify health for you.
+
+### Option B — Manual
+
+Requirements: `go ≥ 1.22`, `claude` CLI, `jq` (recommended), `git`.
 
 ```bash
-# 1. 装依赖(macOS 一键)
-brew install go jq
-npm install -g @anthropic-ai/claude-code   # 或参照官方文档
-
-# 2. 构建
+git clone https://github.com/aconeshana/claude-code-gateway.git
 cd claude-code-gateway
 go build -o gateway .
 
-# 3. 最小配置 — 写 .env (跟 gateway 二进制同目录)
+# Minimal config — same directory as the binary
 cat > .env <<'EOF'
-GATEWAY_DEFAULT_CWD=~/projects        # 你常在哪建 session
-GATEWAY_PROJECT_ROOT=~/projects       # /new <子目录> 解析基准
-ADMIN_MODEL=claude-sonnet-4-6         # 摘要 / 模糊匹配模型,推荐 sonnet
-# 启用飞书(可选)
+GATEWAY_DEFAULT_CWD=~          # fallback dir for main-chat plain text
+ADMIN_MODEL=claude-sonnet-4-6  # for summaries / fuzzy matching
+# Enable Feishu (optional)
 # FEISHU_APP_ID=cli_xxx
 # FEISHU_APP_SECRET=xxx
 EOF
 
-# 4. 启动
-./gateway.sh start              # 后台运行 + 健康检查
-# 或前台 ./gateway
-
-# 5. 浏览器测试控制台(WebSocket 模式)
-open test.html
+./gateway.sh start
 ```
 
-启动后:
-- `:8080/health` 健康检查
-- `:8080/ws` WebSocket 入口
-- 飞书配置好后,在飞书私聊里发 `/help` 看命令列表
-
-完整配置项见 CLAUDE.md「Configuration」表。
+Visit `http://localhost:8080/health` to verify. For Feishu, send `/help` to the bot in DM.
 
 ---
 
-## 常用命令
+## What it does
 
-```bash
-./gateway.sh start              # 启动
-./gateway.sh stop               # 停止
-./gateway.sh restart            # 重启(rebuild + restart)
-./gateway.sh status             # 看运行状态
-./gateway.sh logs               # tail 日志
+- **Multi-session orchestration** — each chat session = one Claude Code CLI subprocess; gateway holds them as a pool with `active / idle / archived` lifecycle.
+- **Cross-restart resumption** — gateway state persists to JSON; sessions resume cleanly via `claude --resume`. No conversation context lost.
+- **Feishu integration** — DM-based slash commands (`/new`, `/list`, `/switch`, `/resume`, `/archive`, `/branch`, `/rename`, `/skills`, `/cron`, `/diff`, `/status`, `/config`, …), reply-in-thread for parallel session isolation, project picker UI.
+- **External session discovery** — finds Claude Code sessions you started from terminal / SDK / IDE, optionally surfaces them in the IM list.
+- **AI-generated summaries** — every N user messages, a tiny admin model regenerates a one-line topic for each session so `/list` stays scannable.
+- **WebSocket transport** — for custom UIs that want raw stream-json events instead of going through an IM channel.
 
-go test -race ./...             # 全测试 + race detector
-go vet ./...                    # 静态检查(没用 lint)
+---
+
+## Architecture
+
+```
+WebSocket / Feishu client                    ┌─────────────────────────┐
+            │                                │ session.Manager         │
+            ▼                                │  · per-owner index      │
+┌────────────────────────────┐               │  · active / idle /      │
+│  channel.Channel adapter   │ Inbound/      │    archived three-state │
+│   (feishu, fake, ws)       │ Outbound      └───────────┬─────────────┘
+└──────────────┬─────────────┘                           │
+               │                                         │
+               ▼                                         ▼
+        ┌──────────────┐                       ┌─────────────────────┐
+        │ bridge.Bridge│  command routing →    │ runtime.Runtime     │
+        │ (commands +  │                       │  (claude-code / fake)│
+        │  rendering)  │                       └──────────┬──────────┘
+        └──────────────┘                                  │
+                                                          ▼
+                                                ┌────────────────────┐
+                                                │ Claude Code CLI    │
+                                                │ stream-json process │
+                                                └────────────────────┘
 ```
 
-飞书 bot 启用后,所有运行时配置(摘要间隔、磁盘扫描窗口、ShareExternal 开关等)用 `/config` 命令在线热更新,不需要重启。
+Full design notes (state machine, V2 routing principles, ghost-session handling, summary worker, persistence schema) live in [`CLAUDE.md`](./CLAUDE.md) and [`docs/state-machine.md`](./docs/state-machine.md).
+
+---
+
+## Configuration
+
+Set via env vars, `.env` next to the binary, or hot-edit via the `/config` command in Feishu.
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `GATEWAY_DEFAULT_CWD` | `~` | fallback working dir for plain-text inbound |
+| `GATEWAY_PERMISSION_MODE` | `auto` | tool-call permission mode (`auto` / `forward`) |
+| `GATEWAY_LISTEN_ADDR` | `:8080` | WebSocket listen address |
+| `GATEWAY_MAX_SESSIONS` | `10` | max concurrent CLI processes |
+| `SUMMARY_INTERVAL` | `5` | regenerate summary every N user messages (0 = off) |
+| `ADMIN_MODEL` | `claude-haiku-4-5` | model used by the summary worker (sonnet recommended in prod) |
+| `GATEWAY_SHARE_EXTERNAL_SESSIONS` | `false` | surface sessions discovered from terminal/SDK use |
+| `GATEWAY_DISCOVERY_WINDOW_DAYS` | `7` | scan window for external session jsonl files |
+| `GATEWAY_DISCOVERY_RESCAN_INTERVAL` | `5m` | how often to rescan disk |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | — | enables Feishu bridge when both set |
+| `FEISHU_ALLOWED_USER_IDS` | — | comma-separated allow list |
+
+---
+
+## Common operations
+
+```bash
+./gateway.sh start          # launch as background daemon
+./gateway.sh stop
+./gateway.sh restart        # rebuild + restart
+./gateway.sh status         # daemon state
+./gateway.sh logs           # tail logs
+
+go test -race ./...         # full test with race detector
+go vet ./...
+```
+
+---
+
+## Development
+
+The codebase is small and self-contained. Key packages:
+
+- `internal/session/` — manager, lifecycle, persist
+- `internal/bridge/` — command routing, card rendering, summary worker
+- `internal/channel/feishu/` — Lark IM adapter (cards, threads, callbacks)
+- `internal/runtime/claude/` — CLI subprocess management & stream-json codec
+- `internal/gateway/` — WebSocket transport
+
+See [`CLAUDE.md`](./CLAUDE.md) for conventions and architectural decisions.
+
+---
+
+## License
+
+Apache 2.0. See [`LICENSE`](./LICENSE).

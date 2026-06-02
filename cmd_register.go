@@ -21,12 +21,12 @@ const (
 )
 
 type regBeginResp struct {
-	DeviceCode      string `json:"device_code"`
-	VerifyURI       string `json:"verification_uri_complete"`
-	ExpiresIn       int    `json:"expires_in"`
-	Interval        int    `json:"interval"`
-	Error           string `json:"error"`
-	ErrorDesc       string `json:"error_description"`
+	DeviceCode string `json:"device_code"`
+	VerifyURI  string `json:"verification_uri_complete"`
+	ExpiresIn  int    `json:"expires_in"`
+	Interval   int    `json:"interval"`
+	Error      string `json:"error"`
+	ErrorDesc  string `json:"error_description"`
 }
 
 type regPollResp struct {

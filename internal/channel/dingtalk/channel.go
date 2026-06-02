@@ -627,6 +627,7 @@ func parseRichTextContent(content interface{}) (texts []string, downloadCodes []
 	}
 	return
 }
+
 // POST https://api.dingtalk.com/v1.0/robot/messageFiles/download
 // This API returns a JSON response with a downloadUrl field; we then GET that URL
 // to retrieve the actual file bytes.

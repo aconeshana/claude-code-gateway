@@ -134,6 +134,40 @@ func (s *JSONStore) CountSkippedExternalSummaries(minVersion int) int {
 	return n
 }
 
+// CountFreshExternalSummariesIn restricts CountFreshExternalSummaries to
+// records whose CLI session id is in cliIDs. Used by /status so percentages
+// stay bounded by the live external inventory.
+func (s *JSONStore) CountFreshExternalSummariesIn(minVersion int, cliIDs map[string]bool) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for id, a := range s.externalAugs {
+		if !cliIDs[id] {
+			continue
+		}
+		if a.PromptVersion >= minVersion && a.Summary != "" {
+			n++
+		}
+	}
+	return n
+}
+
+// CountSkippedExternalSummariesIn is the scoped form of CountSkippedExternalSummaries.
+func (s *JSONStore) CountSkippedExternalSummariesIn(minVersion int, cliIDs map[string]bool) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for id, a := range s.externalAugs {
+		if !cliIDs[id] {
+			continue
+		}
+		if a.PromptVersion >= minVersion && a.Summary == "" {
+			n++
+		}
+	}
+	return n
+}
+
 // ClearExternalSummary drops the cached augmentation for one external session.
 // Used by startup cleanup when we identify a session as gateway-internal noise
 // (admin-worker / eval scratch). Caller should Save afterwards.

@@ -136,8 +136,8 @@ type Session struct {
 	// — shows the user what they actually said last, regardless of Origin.
 	LatestUserMessage string
 	Origin            string // see OriginXxx constants — provenance of the session
-	ChatID      string
-	ChannelKind string
+	ChatID            string
+	ChannelKind       string
 
 	// ThreadID, when set, binds this session to a Lark thread. The bridge
 	// routes inbound messages carrying this ThreadID to this session, and
@@ -153,8 +153,8 @@ type Session struct {
 	// "unknown" (rendering omits it).
 	MessageCount int
 
-	Status      Status
-	ArchivedAt  time.Time
+	Status     Status
+	ArchivedAt time.Time
 
 	rt           runtime.Runtime
 	codec        runtime.Codec
@@ -188,27 +188,27 @@ type Session struct {
 }
 
 type SessionInfo struct {
-	ID             string `json:"id"`
-	CLISessionID   string `json:"cli_session_id"`
-	State          string `json:"state"`
-	WorkingDir     string `json:"working_dir"`
-	PendingTurns   int    `json:"pending_turns"`
-	PermissionMode string `json:"permission_mode"`
-	CreatedAt      string `json:"created_at"`
-	LastActivity   string `json:"last_activity"`
-	OwnerID        string `json:"owner_id,omitempty"`
-	Label          string `json:"label,omitempty"`
-	Summary        string `json:"summary,omitempty"`
-	CustomTitle    string `json:"custom_title,omitempty"`
+	ID                string `json:"id"`
+	CLISessionID      string `json:"cli_session_id"`
+	State             string `json:"state"`
+	WorkingDir        string `json:"working_dir"`
+	PendingTurns      int    `json:"pending_turns"`
+	PermissionMode    string `json:"permission_mode"`
+	CreatedAt         string `json:"created_at"`
+	LastActivity      string `json:"last_activity"`
+	OwnerID           string `json:"owner_id,omitempty"`
+	Label             string `json:"label,omitempty"`
+	Summary           string `json:"summary,omitempty"`
+	CustomTitle       string `json:"custom_title,omitempty"`
 	LatestUserMessage string `json:"latest_user_message,omitempty"`
-	Origin         string `json:"origin,omitempty"`
-	ChatID         string `json:"chat_id,omitempty"`
-	ChannelKind    string `json:"channel_kind,omitempty"`
-	ThreadID       string `json:"thread_id,omitempty"`
-	RootMessageID  string `json:"root_message_id,omitempty"`
-	MessageCount   int    `json:"message_count,omitempty"`
-	Status         string `json:"status,omitempty"`
-	ArchivedAt     string `json:"archived_at,omitempty"`
+	Origin            string `json:"origin,omitempty"`
+	ChatID            string `json:"chat_id,omitempty"`
+	ChannelKind       string `json:"channel_kind,omitempty"`
+	ThreadID          string `json:"thread_id,omitempty"`
+	RootMessageID     string `json:"root_message_id,omitempty"`
+	MessageCount      int    `json:"message_count,omitempty"`
+	Status            string `json:"status,omitempty"`
+	ArchivedAt        string `json:"archived_at,omitempty"`
 }
 
 // NewSession spawns a runtime instance and wraps it in a Session.
@@ -253,26 +253,26 @@ func (s *Session) Info() SessionInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	info := SessionInfo{
-		ID:             s.ID,
-		CLISessionID:   s.CLISessionID,
-		State:          s.state.String(),
-		WorkingDir:     s.WorkingDir,
-		PendingTurns:   s.pendingTurns,
-		PermissionMode: s.PermissionMode,
-		CreatedAt:      s.CreatedAt.Format(time.RFC3339),
-		LastActivity:   s.lastActivity.Format(time.RFC3339),
-		OwnerID:        s.OwnerID,
-		Label:          s.Label,
-		Summary:        s.Summary,
-		CustomTitle:    s.CustomTitle,
+		ID:                s.ID,
+		CLISessionID:      s.CLISessionID,
+		State:             s.state.String(),
+		WorkingDir:        s.WorkingDir,
+		PendingTurns:      s.pendingTurns,
+		PermissionMode:    s.PermissionMode,
+		CreatedAt:         s.CreatedAt.Format(time.RFC3339),
+		LastActivity:      s.lastActivity.Format(time.RFC3339),
+		OwnerID:           s.OwnerID,
+		Label:             s.Label,
+		Summary:           s.Summary,
+		CustomTitle:       s.CustomTitle,
 		LatestUserMessage: s.LatestUserMessage,
-		Origin:         s.Origin,
-		ChatID:         s.ChatID,
-		ChannelKind:    s.ChannelKind,
-		ThreadID:       s.ThreadID,
-		RootMessageID:  s.RootMessageID,
-		MessageCount:   s.MessageCount,
-		Status:         string(s.Status),
+		Origin:            s.Origin,
+		ChatID:            s.ChatID,
+		ChannelKind:       s.ChannelKind,
+		ThreadID:          s.ThreadID,
+		RootMessageID:     s.RootMessageID,
+		MessageCount:      s.MessageCount,
+		Status:            string(s.Status),
 	}
 	if !s.ArchivedAt.IsZero() {
 		info.ArchivedAt = s.ArchivedAt.Format(time.RFC3339)

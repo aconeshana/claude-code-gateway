@@ -292,8 +292,8 @@ var adminPromptFingerprints = []string{
 	// legacy (pre-marker) — remove after enough time has passed
 	"总结一个 claude-code session",
 	"总结这个 claude-code session", // 旧 admin worker 用 "这个"，跟 "一个" 差一字
-	"30 字内中文总结",                 // admin worker summary task
-	"运行 `tail -n",                 // admin worker scans other session jsonls
+	"30 字内中文总结",                // admin worker summary task
+	"运行 `tail -n",              // admin worker scans other session jsonls
 	`jq -r 'select((.type == "user"`,
 	"_skip_meta_",
 }

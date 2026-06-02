@@ -118,6 +118,25 @@ internal/
 
 **Gateway transport**:`CreateSessionPayload.Runtime json.RawMessage` 是 opaque envelope,由 `runtime.Factory` 解析。30+ claude flag 字段不再出现在 gateway 协议中(向后不兼容)。
 
+## V2 路由优先级(顶层原则)
+
+所有 Session / Thread / Focus 决策按以下顺序应用,**前者优先级最高**:
+
+1. **复用已有 thread**:若 sess 已有 ThreadID 绑定,任何"恢复/激活/转发"行为都路由进该 thread;不开新 thread,不让该 sess 抢主聊天 focus。
+2. **保护已有 focus**:若用户主聊天有 Active focus,新创建/恢复的 sess 一律进新 thread;priorFocus 保持。
+3. **主聊天作为默认容器**:无 thread、无 priorFocus 时,新 sess 才接管主聊天 focus。
+4. **主聊天只承载命令/全局动作**:thread 内只做该 sess 自身的对话。
+
+实现要点:
+- 原则 1 由 `afterCreateOrActivate` 在 `priorFocus == nil` 分支显式检查 `newSess.ThreadID` 落地 — 命中则 `ClearFocus` 并把 welcome 发进既有 thread(`openThreadForSession` 内部 Reply API 复用)。
+- 原则 2 由 `snapshotFocus` + `afterCreateOrActivate` 主路径落地(priorFocus 还原 + 新 sess 进新 thread)。
+- 原则 3 是 mgr.Create / Reactivate 默认副作用(直接 SetFocus 到新 sess)。
+- 原则 4 由各命令的 `m.ThreadID != ""` 拒绝分支落地(`/new` `/switch` `/branch` `/list` `/project` 拒绝 thread)。
+
+**核心不变量**:focus 只可能是 None 或指向 Active session(`TransitionToIdle` ClearFocus, `Archive` ClearFocus, `/terminate` 兜底切下一个 active)。
+
+**详细状态机**:见 `docs/state-machine.md`(包含 5 个 mermaid 图 + 命令矩阵 + 修订过的 BUG 列表)。
+
 ## Conventions(开发约定)
 
 这些是踩过坑写下来的硬规则,新代码必须遵守:
@@ -200,6 +219,17 @@ pick_dir_confirm (path, purpose) → handlePickDirConfirm
 ### Workspace 路径(简化)
 
 `GATEWAY_DEFAULT_CWD` 是主聊天 plain text 兜底 dir(用户没选项目直接发字时新建 session 用)。默认 `~`,不强制 setup。`/new` 不再用 `GATEWAY_PROJECT_ROOT` 解析子目录 — 项目通过 `/project` 显式选,跨级目录由 PickDir flow 自由组合。
+
+### Card 布局(飞书)
+
+通用 `channel.Card/Section/Form` 抽象在 feishu renderer 提供 3 种增强布局,通过 hint 字段触发:
+
+- `Section.ButtonLayout = "fill"` — 多按钮等宽撑满卡宽(column_set + width=fill,N=2 时 flex_mode=bisect)。适用 `/list` 每条 session 行(4 个按钮均匀分布,不再左聚集)
+- `Section.ButtonLayout = "trailing"` — markdown 左 + 单按钮右(column_set 2 列:左 weighted weight=5, 右 width=auto)。适用单操作行,行高比堆叠减半
+- `Form.SecondaryButtons []Button` — 跟 Submit 横排放在 form 末尾(column_set 左对齐 + width=auto)。适用 `[保存][取消]` 这类二选一表单,避免按钮各占一行
+- `Form.LeadingButtons []Button` — 输入框前的非提交按钮(跟 input + Submit 同一 column_set)。适用 `/skills [详情][input][执行]` 这类 inline 操作
+
+设计参考来自 [chenhg5/cc-connect](https://github.com/chenhg5/cc-connect) `platform/feishu/card.go` 的 `CardActionLayoutEqualColumns` 和 `CardListItem` 模式。**新加卡片渲染优先用这些 hint,不要直接堆 Markdown + 多个 Buttons section**。
 
 ## Configuration
 

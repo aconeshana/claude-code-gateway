@@ -14,6 +14,7 @@ import (
 	"github.com/anthropics/claude-code-gateway/internal/bridge"
 	dingtalkCh "github.com/anthropics/claude-code-gateway/internal/channel/dingtalk"
 	feishuCh "github.com/anthropics/claude-code-gateway/internal/channel/feishu"
+	"github.com/anthropics/claude-code-gateway/internal/cron"
 	"github.com/anthropics/claude-code-gateway/internal/gateway"
 	"github.com/anthropics/claude-code-gateway/internal/runtime"
 	"github.com/anthropics/claude-code-gateway/internal/runtime/claude"
@@ -73,6 +74,9 @@ func cmdServe() {
 		channelShutdown func()
 	)
 
+	// Cron store + run history — shared by all channel paths.
+	cronStore, cronRunLog := initCronState()
+
 	if cfg.Feishu.AppID != "" && cfg.DingTalk.AppKey != "" {
 		log.Fatalf("cannot enable both Feishu and DingTalk channels; configure only one")
 	}
@@ -102,6 +106,8 @@ func cmdServe() {
 			RescanInterval:      cfg.DiscoveryRescanInterval,
 			ApplyAllowedUsers:   feiCh.SetAllowedUserIDs,
 			ApplyCLIPath:        rt.SetCLIPath,
+			CronStore:           cronStore,
+			CronRunLog:          cronRunLog,
 		})
 		newBridge.Start(ctx)
 		channelShutdown = feiCh.Shutdown
@@ -136,6 +142,8 @@ func cmdServe() {
 			RescanInterval:      cfg.DiscoveryRescanInterval,
 			ApplyAllowedUsers:   dtCh.SetAllowedUserIDs,
 			ApplyCLIPath:        rt.SetCLIPath,
+			CronStore:           cronStore,
+			CronRunLog:          cronRunLog,
 		})
 		newBridge.Start(ctx)
 		channelShutdown = dtCh.Shutdown
@@ -239,4 +247,25 @@ func migrateRuntimeFiles() {
 			}
 		}
 	}
+}
+
+// initCronState creates cron store and run log instances backed by ~/.ccg/.
+// Returns nil for both if filesystem initialisation fails.
+func initCronState() (cron.Store, *cron.RunLog) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("[cron] cannot determine home dir: %v — cron disabled", err)
+		return nil, nil
+	}
+	ccg := filepath.Join(home, ".ccg")
+	_ = os.MkdirAll(ccg, 0700)
+
+	store, err := cron.NewJSONStore(filepath.Join(ccg, "cron_jobs.json"))
+	if err != nil {
+		log.Printf("[cron] failed to init store: %v — cron disabled", err)
+		return nil, nil
+	}
+	rl := cron.NewRunLog(filepath.Join(ccg, "cron_history.json"), 20)
+	log.Printf("[cron] store and history loaded from %s", ccg)
+	return store, rl
 }
