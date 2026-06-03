@@ -176,9 +176,33 @@ type Session struct {
 	// rather than the session's pinned thread binding. A user can therefore
 	// type in main chat → bot replies in main chat, even when the session is
 	// thread-bound (the thread entry card remains a separate access point).
+	//
+	// lastInboundMsgID is the user's most recent message id; bridge uses it
+	// as the Reply API anchor so streamed bot cards render with a quote
+	// bubble of the specific question being answered. lastInboundIsGroup
+	// gates group-only UX (quote bubble, @-mention) — false for P2P so
+	// 1-on-1 chats stay quiet.
+	//
+	// lastReactionMsgID / lastReactionID hold the pending "OnIt" reaction
+	// added to the user's inbound msg. Renderer clears it when the agent
+	// produces its Done card so the visual cue tracks the actual state.
 	lastInboundChatID    string
 	lastInboundThreadID  string
 	lastInboundRootMsgID string
+	lastInboundMsgID     string
+	lastInboundUserID    string
+	lastInboundIsGroup   bool
+	lastReactionMsgID    string
+	lastReactionID       string
+
+	// interruptedByUser is set when /stop sent a SIGINT-style "interrupt"
+	// control to the CLI. The renderer reads this on the next ResultMessage:
+	// the CLI marks interrupted turns as IsError=true (it's a non-zero
+	// exit from its perspective), but to the human who literally just
+	// asked to stop, rendering this as a red "Error" card is misleading.
+	// Renderer should treat it as a neutral "Stopped" outcome instead and
+	// clear the flag so subsequent turns aren't tagged.
+	interruptedByUser bool
 
 	// Summary-related runtime state (used by manager.AppendRecentMessage /
 	// ShouldUpdateSummary). Guarded by mu.
@@ -280,25 +304,92 @@ func (s *Session) Info() SessionInfo {
 	return info
 }
 
-// SetLastInbound records the chat / thread / root-message-id of the most
-// recent user message routed to this session. Bridge output (renderer cards,
-// streamed assistant text) consults this to decide where to post replies,
-// so a thread-bound session can still answer in main chat when the user
-// types there. Transient — not persisted across restarts.
-func (s *Session) SetLastInbound(chatID, threadID, rootMsgID string) {
+// InboundLocation captures the routing context of the most recent inbound
+// message: where it came from (chat, optional thread), the user's message
+// id (used as Reply API quote anchor for streamed bot output), and the
+// group/user info needed to decide @-mention behavior.
+//
+// Bridges build an InboundLocation per inbound and pass it to SetLastInbound;
+// renderer code reads it back via LastInbound() to route streamed output
+// correctly.
+type InboundLocation struct {
+	ChatID    string
+	ThreadID  string
+	RootMsgID string // thread root, for sessions pinned to a thread
+	MsgID     string // user's latest message — Reply API quote anchor
+	UserID    string // for group @-mention
+	IsGroup   bool
+}
+
+// SetLastInbound records the routing context of the most recent user message
+// routed to this session. Bridge output (renderer cards, streamed assistant
+// text) consults this to decide where to post replies, so a thread-bound
+// session can still answer in main chat when the user types there.
+// Transient — not persisted across restarts.
+func (s *Session) SetLastInbound(loc InboundLocation) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.lastInboundChatID = chatID
-	s.lastInboundThreadID = threadID
-	s.lastInboundRootMsgID = rootMsgID
+	s.lastInboundChatID = loc.ChatID
+	s.lastInboundThreadID = loc.ThreadID
+	s.lastInboundRootMsgID = loc.RootMsgID
+	s.lastInboundMsgID = loc.MsgID
+	s.lastInboundUserID = loc.UserID
+	s.lastInboundIsGroup = loc.IsGroup
 }
 
 // LastInbound returns the most recent inbound location (see SetLastInbound).
-// chatID is "" when no inbound has been recorded since spawn.
-func (s *Session) LastInbound() (chatID, threadID, rootMsgID string) {
+// ChatID is "" when no inbound has been recorded since spawn.
+func (s *Session) LastInbound() InboundLocation {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.lastInboundChatID, s.lastInboundThreadID, s.lastInboundRootMsgID
+	return InboundLocation{
+		ChatID:    s.lastInboundChatID,
+		ThreadID:  s.lastInboundThreadID,
+		RootMsgID: s.lastInboundRootMsgID,
+		MsgID:     s.lastInboundMsgID,
+		UserID:    s.lastInboundUserID,
+		IsGroup:   s.lastInboundIsGroup,
+	}
+}
+
+// SetPendingReaction records the "OnIt"-style reaction the channel just
+// added to the user's inbound message, so the renderer can clear it when
+// the agent finishes a turn. Calling this with empty args clears the
+// pending entry (used after the cleanup completes).
+func (s *Session) SetPendingReaction(msgID, reactionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastReactionMsgID = msgID
+	s.lastReactionID = reactionID
+}
+
+// PendingReaction returns the most recent unfinished reaction pair, if
+// any. Both values are "" when there's nothing to clean up.
+func (s *Session) PendingReaction() (msgID, reactionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastReactionMsgID, s.lastReactionID
+}
+
+// MarkInterrupted records that the most recent CLI exit was caused by a
+// user-initiated /stop, not a genuine fault. The renderer reads this via
+// ConsumeInterruptedFlag when it sees IsError=true so the user-visible
+// outcome is "Stopped" rather than "Error".
+func (s *Session) MarkInterrupted() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.interruptedByUser = true
+}
+
+// ConsumeInterruptedFlag returns whether MarkInterrupted was set since
+// the last consume, and clears the flag in the same call so it doesn't
+// poison subsequent turns.
+func (s *Session) ConsumeInterruptedFlag() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	was := s.interruptedByUser
+	s.interruptedByUser = false
+	return was
 }
 
 // SetMessageCount caches the user-turn count on the session. The bridge's

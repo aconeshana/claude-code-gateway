@@ -88,6 +88,10 @@ func (b *Bridge) handleSessionEvent(ctx context.Context, sess *session.Session, 
 		return
 	}
 
+	// Stamp activity for every recognized event so the HUD's elapsed /
+	// "since last event" reflect real CLI activity, not just text emissions.
+	state.noteEvent()
+
 	switch msgType {
 	case protocol.MsgTypeSystem:
 		var sysMsg protocol.SystemInitMessage
@@ -105,11 +109,31 @@ func (b *Bridge) handleSessionEvent(ctx context.Context, sess *session.Session, 
 		// cache_read tokens when there are multiple turns — the assistant message's
 		// inner usage reflects the actual last-call context size.
 		updateContextPctFromAssistant(state, raw)
+		// Capture the latest tool_use (if any) so the HUD can surface
+		// "running Bash · tcpdump…" instead of a generic "processing".
+		// A text-only assistant message means the model just spoke without
+		// invoking a tool — clear the indicator so the HUD doesn't show
+		// a stale tool name during the model's monologue.
+		toolLabel := extractCurrentTool(raw)
+		if toolLabel != "" {
+			state.setCurrentTool(toolLabel)
+		} else if hasOnlyText(raw) {
+			state.setCurrentTool("")
+		}
 		text := extractAssistantText(raw)
-		if text == "" {
+		if text != "" {
+			state.appendText(ctx, b, chatID, text)
 			return
 		}
-		state.appendText(ctx, b, chatID, text)
+		// No user-visible text in this turn-step yet — the model may be
+		// thinking and going straight to a tool. Without an empty-text
+		// shortcut the user would see nothing for as long as the tool
+		// runs (Bash with multi-minute commands is the canonical case).
+		// Render a tool-only progress card so the HUD ("🔧 Bash · …",
+		// elapsed clock, heartbeat ticker) starts moving immediately.
+		if toolLabel != "" {
+			state.ensureProgressCard(ctx, b, chatID)
+		}
 	case protocol.MsgTypeResult:
 		var result protocol.ResultMessage
 		if err := json.Unmarshal(raw, &result); err != nil {
@@ -137,6 +161,135 @@ type streamState struct {
 	dirty        bool
 	timer        *time.Timer
 	finalized    bool
+
+	// Per-turn lifetime — reset on finalize so a long-lived session doesn't
+	// inherit elapsed counters from previous turns.
+	turnStart     time.Time // first event of the current turn
+	lastEvent     time.Time // most recent event (text/tool/etc.) for "Ys ago"
+	currentTool   string    // e.g. "Bash · tcpdump…" (empty between tools)
+	heartbeatStop chan struct{}
+}
+
+// startHeartbeat ensures a background goroutine is re-rendering the
+// processing card on a fixed cadence (in addition to event-driven updates).
+// Without it, a turn that triggers a single long-running tool can leave the
+// HUD frozen for many minutes — the user can't tell whether the agent is
+// still alive. Called by appendText after the first card lands; safe to
+// call repeatedly (subsequent calls are no-ops while one is already running).
+//
+// Concurrency: caller MUST hold s.mu. The heartbeatStop field is read and
+// written here without taking the mutex; relying on the caller's lock keeps
+// startHeartbeat / stopHeartbeat / appendText / finalize / flush serialized.
+func (s *streamState) startHeartbeat(ctx context.Context, b *Bridge, chatID string) {
+	if s.heartbeatStop != nil {
+		return
+	}
+	stop := make(chan struct{})
+	s.heartbeatStop = stop
+	go func() {
+		// 45s strikes a balance — frequent enough that "still alive" is
+		// obvious in the UI, but well under Lark's update API throttling
+		// and far less chatty than per-second.
+		t := time.NewTicker(45 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.C:
+				s.renderHeartbeat(ctx, b, chatID)
+			}
+		}
+	}()
+}
+
+// stopHeartbeat signals the heartbeat goroutine to exit. Idempotent.
+// Concurrency: caller MUST hold s.mu (see startHeartbeat).
+func (s *streamState) stopHeartbeat() {
+	if s.heartbeatStop == nil {
+		return
+	}
+	close(s.heartbeatStop)
+	s.heartbeatStop = nil
+}
+
+// renderHeartbeat re-issues the processing card with refreshed timestamps
+// in the HUD. No content change — just a beat so the user sees the clock
+// move and (when present) the current tool name stays accurate.
+func (s *streamState) renderHeartbeat(ctx context.Context, b *Bridge, chatID string) {
+	s.mu.Lock()
+	if s.finalized || s.messageID == "" {
+		s.mu.Unlock()
+		return
+	}
+	msgID := s.messageID
+	content := truncate(s.textBuf.String())
+	card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.turnStart, s.lastEvent)
+	s.mu.Unlock()
+	_ = b.updateCard(ctx, msgID, card)
+}
+
+// noteEvent stamps the per-turn timestamps. Called by handleSessionEvent
+// for every CLI event so elapsed / "Ys ago" reflect real activity rather
+// than just text emissions.
+func (s *streamState) noteEvent() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	if s.turnStart.IsZero() {
+		s.turnStart = now
+	}
+	s.lastEvent = now
+}
+
+// ensureProgressCard sends an initial Processing card when the model has
+// committed to a tool call but produced no user-visible text yet.
+// Without this, a turn that opens with a long-running tool (Bash with a
+// minute-long find / WebFetch / multi-step Grep) leaves the user
+// staring at silence — the existing appendText-driven card creation
+// only fires on text events.
+//
+// Called from the MsgTypeAssistant branch when text=="" but a tool_use
+// exists. Subsequent appendText calls reuse the same messageID and the
+// heartbeat ticker keeps the card alive.
+func (s *streamState) ensureProgressCard(ctx context.Context, b *Bridge, chatID string) {
+	s.mu.Lock()
+	if s.finalized || s.messageID != "" {
+		s.mu.Unlock()
+		return
+	}
+	if strings.HasPrefix(s.sessionShort, "gw:") {
+		s.sessionShort = displaySessionID(s.sess)
+	}
+	// Empty body — the HUD note carries everything user-visible
+	// (current tool, elapsed). The body fills in once assistant text
+	// arrives.
+	card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, "_(thinking · running tool…)_", s.currentTool, s.turnStart, s.lastEvent)
+	s.mu.Unlock()
+
+	msgID, err := b.sendCardForSession(ctx, s.sess, chatID, card)
+	if err != nil {
+		return
+	}
+
+	s.mu.Lock()
+	// Re-check finalized: could have raced with a concurrent finalize.
+	if s.finalized {
+		s.mu.Unlock()
+		return
+	}
+	s.messageID = msgID
+	s.lastUpdate = time.Now()
+	s.startHeartbeat(ctx, b, chatID)
+	s.mu.Unlock()
+}
+
+// setCurrentTool updates the visible tool indicator. Pass "" to clear
+// (e.g. when a tool_result arrives signalling completion).
+func (s *streamState) setCurrentTool(label string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.currentTool = label
 }
 
 func (s *streamState) appendText(ctx context.Context, b *Bridge, chatID, text string) {
@@ -156,13 +309,18 @@ func (s *streamState) appendText(ctx context.Context, b *Bridge, chatID, text st
 
 	if s.messageID == "" {
 		content := truncate(s.textBuf.String())
-		msgID, err := b.sendCardForSession(ctx, s.sess, chatID, b.processingCardWithID(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content))
+		card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.turnStart, s.lastEvent)
+		msgID, err := b.sendCardForSession(ctx, s.sess, chatID, card)
 		if err != nil {
 			return
 		}
 		s.messageID = msgID
 		s.lastUpdate = time.Now()
 		s.dirty = false
+		// Now that there's a card to refresh, start the background
+		// heartbeat. Calls are idempotent so the cost of misfiring is
+		// nil — only one goroutine ever runs per turn.
+		s.startHeartbeat(ctx, b, chatID)
 		return
 	}
 
@@ -183,7 +341,8 @@ func (s *streamState) appendText(ctx context.Context, b *Bridge, chatID, text st
 		}
 		s.timer = nil
 		content := truncate(s.textBuf.String())
-		_ = b.updateCard(ctx, s.messageID, b.processingCardWithID(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content))
+		card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.turnStart, s.lastEvent)
+		_ = b.updateCard(ctx, s.messageID, card)
 		s.lastUpdate = time.Now()
 		s.dirty = false
 	})
@@ -196,6 +355,7 @@ func (s *streamState) finalize(ctx context.Context, b *Bridge, chatID string, re
 		s.timer = nil
 	}
 	s.finalized = true
+	s.stopHeartbeat()
 	msgID := s.messageID
 	buffered := s.textBuf.String()
 	project := s.project
@@ -223,20 +383,32 @@ func (s *streamState) finalize(ctx context.Context, b *Bridge, chatID string, re
 	}
 	content = truncate(content)
 
-	card := b.resultCardWithID(project, sessionShort, summary, model, gitBranch, contextPct, content, result)
+	// If the user just /stop-ed this session, the CLI exits with IsError=true
+	// even though that's exactly what they asked for. Consume the flag here
+	// so resultCardWithID can render a neutral "Stopped" card instead of a
+	// scary red "Error".
+	interrupted := s.sess != nil && s.sess.ConsumeInterruptedFlag()
+
+	card := b.resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch, contextPct, content, result, interrupted)
 	if msgID != "" {
-		if err := b.updateCard(ctx, msgID, card); err != nil {
-			_, _ = b.sendCardForSession(ctx, s.sess, chatID, card)
+		if err := b.updateFinalCardForSession(ctx, msgID, s.sess, card); err != nil {
+			_, _ = b.sendFinalCardForSession(ctx, s.sess, chatID, card)
 		}
 	} else {
-		_, _ = b.sendCardForSession(ctx, s.sess, chatID, card)
+		_, _ = b.sendFinalCardForSession(ctx, s.sess, chatID, card)
 	}
+	b.clearPendingReaction(s.sess)
 
 	s.mu.Lock()
 	s.messageID = ""
 	s.textBuf.Reset()
 	s.dirty = false
 	s.finalized = false
+	// Per-turn lifetime ends here — clear so the next turn's heartbeat
+	// reports a fresh elapsed counter and doesn't carry stale tool labels.
+	s.turnStart = time.Time{}
+	s.lastEvent = time.Time{}
+	s.currentTool = ""
 	s.mu.Unlock()
 }
 
@@ -248,6 +420,11 @@ func (s *streamState) flush() {
 		s.timer.Stop()
 		s.timer = nil
 	}
+	// stop the heartbeat goroutine too — flush() is the catch-all
+	// shutdown path (ctx cancellation, subscriber channel close, session
+	// reactivate), and a lingering ticker would keep firing renders
+	// against a finalized state forever.
+	s.stopHeartbeat()
 }
 
 func (b *Bridge) processingCard(project, summary, model, gitBranch string, contextPct int, content string) channel.Card {
@@ -259,6 +436,15 @@ func (b *Bridge) processingCard(project, summary, model, gitBranch string, conte
 // suffix lets users running multiple parallel sessions identify which card
 // belongs to which session at a glance, and copy the id for /switch.
 func (b *Bridge) processingCardWithID(project, sessionShort, summary, model, gitBranch string, contextPct int, content string) channel.Card {
+	return b.processingCardWithProgress(project, sessionShort, summary, model, gitBranch, contextPct, content, "", time.Time{}, time.Time{})
+}
+
+// processingCardWithProgress is the full-fat variant used by streamSession
+// — same shape as processingCardWithID but with the "still alive" signals
+// (current tool, turn-start, last-event) woven into the HUD note so a
+// user staring at the card for 17 minutes can tell whether the agent is
+// still working or stuck.
+func (b *Bridge) processingCardWithProgress(project, sessionShort, summary, model, gitBranch string, contextPct int, content, currentTool string, turnStart, lastEvent time.Time) channel.Card {
 	title := "Processing"
 	if project != "" {
 		title += ": " + project
@@ -266,7 +452,7 @@ func (b *Bridge) processingCardWithID(project, sessionShort, summary, model, git
 	if sessionShort != "" {
 		title += " · " + sessionShort
 	}
-	hud := buildHUDNote(model, gitBranch, contextPct, "处理中...")
+	hud := buildProcessingHUDNote(model, gitBranch, contextPct, currentTool, turnStart, lastEvent)
 	note := hud
 	if summary != "" {
 		note = summary + " | " + hud
@@ -286,9 +472,20 @@ func (b *Bridge) resultCard(project, summary, model, gitBranch string, contextPc
 }
 
 func (b *Bridge) resultCardWithID(project, sessionShort, summary, model, gitBranch string, contextPct int, content string, result *protocol.ResultMessage) channel.Card {
+	return b.resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch, contextPct, content, result, false)
+}
+
+// resultCardWithIDAndInterrupt is the parameterized form used by streamSession.
+// interrupted=true means /stop fired before the CLI exited; render as a neutral
+// "Stopped" card instead of a red "Error" card so the UX matches user intent.
+func (b *Bridge) resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch string, contextPct int, content string, result *protocol.ResultMessage, interrupted bool) channel.Card {
 	title := "Done"
 	tone := channel.ToneSuccess
-	if result.IsError {
+	switch {
+	case interrupted:
+		title = "Stopped"
+		tone = channel.ToneNeutral
+	case result.IsError:
 		title = "Error"
 		tone = channel.ToneError
 	}
@@ -375,6 +572,168 @@ func buildHUDNote(model, gitBranch string, contextPct int, suffix string) string
 		return suffix
 	}
 	return hud + " | " + suffix
+}
+
+// buildProcessingHUDNote extends the standard HUD with two "still alive"
+// indicators consumed by the in-progress card:
+//   - currentTool: e.g. "🔧 Bash · tcpdump…" when known; falls back to
+//     "处理中..." so the suffix is always present.
+//   - turnStart / lastEvent: produces "已运行 17m · 30s ago" so the user
+//     can tell whether the card is fresh or stale at a glance.
+//
+// All extras are appended as additional " | "-separated cells onto the
+// HUD line so the layout stays one line — flagged as the preferred
+// design in the test card sent to the user.
+func buildProcessingHUDNote(model, gitBranch string, contextPct int, currentTool string, turnStart, lastEvent time.Time) string {
+	suffix := "处理中..."
+	if currentTool != "" {
+		suffix = "🔧 " + currentTool
+	}
+	if !turnStart.IsZero() {
+		elapsed := time.Since(turnStart)
+		suffix += " | 已运行 " + formatShortDuration(elapsed)
+		if !lastEvent.IsZero() && time.Since(lastEvent) >= 5*time.Second {
+			suffix += " · " + formatShortDuration(time.Since(lastEvent)) + " ago"
+		}
+	}
+	return buildHUDNote(model, gitBranch, contextPct, suffix)
+}
+
+// formatShortDuration renders a duration in the most compact form that
+// still conveys the right magnitude: "30s", "5m", "1h12m". Avoids the
+// noisy "1h12m34s" you get from time.Duration.String().
+func formatShortDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	h := int(d.Hours())
+	m := int(d.Minutes()) - h*60
+	if m == 0 {
+		return fmt.Sprintf("%dh", h)
+	}
+	return fmt.Sprintf("%dh%dm", h, m)
+}
+
+// extractCurrentTool finds the most recent tool_use block in an assistant
+// stream-json message and returns a short, HUD-friendly label.
+// Example outputs:
+//
+//	Bash · tcpdump -i en0 …
+//	Edit · cards.go
+//	Read · /Users/xmly/…/renderer.go
+//
+// Returns "" when no tool_use block is present (pure text turn) so the
+// caller can decide whether to clear or leave the previous label.
+func extractCurrentTool(raw json.RawMessage) string {
+	var msg struct {
+		Message json.RawMessage `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return ""
+	}
+	var apiMsg struct {
+		Content []struct {
+			Type  string          `json:"type"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(msg.Message, &apiMsg); err != nil {
+		return ""
+	}
+	for i := len(apiMsg.Content) - 1; i >= 0; i-- {
+		c := apiMsg.Content[i]
+		if c.Type != "tool_use" || c.Name == "" {
+			continue
+		}
+		return c.Name + summarizeToolInput(c.Name, c.Input)
+	}
+	return ""
+}
+
+// summarizeToolInput pulls a brief, single-line preview out of a tool's
+// input bag — picks the field most useful for telling tools apart at a
+// glance (Bash → command, Edit/Read/Write → file_path, etc.). Returns
+// "" when there's nothing useful to add (caller renders just the name).
+func summarizeToolInput(toolName string, input json.RawMessage) string {
+	if len(input) == 0 {
+		return ""
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(input, &m); err != nil {
+		return ""
+	}
+	pick := func(keys ...string) string {
+		for _, k := range keys {
+			if v, ok := m[k]; ok {
+				if s, ok := v.(string); ok && s != "" {
+					return s
+				}
+			}
+		}
+		return ""
+	}
+	var preview string
+	switch toolName {
+	case "Bash":
+		preview = pick("command")
+	case "Edit", "Write", "Read", "NotebookEdit":
+		preview = pick("file_path", "notebook_path")
+		// strip leading directories so the HUD shows a recognizable basename
+		if idx := strings.LastIndex(preview, "/"); idx >= 0 {
+			preview = preview[idx+1:]
+		}
+	case "Grep", "Glob":
+		preview = pick("pattern", "query")
+	case "WebFetch", "WebSearch":
+		preview = pick("url", "query")
+	default:
+		// Best-effort: try the most common keys.
+		preview = pick("command", "file_path", "pattern", "query", "url", "description")
+	}
+	if preview == "" {
+		return ""
+	}
+	const cap = 32
+	if len([]rune(preview)) > cap {
+		preview = string([]rune(preview)[:cap]) + "…"
+	}
+	preview = strings.ReplaceAll(preview, "\n", " ")
+	return " · " + preview
+}
+
+// hasOnlyText reports whether an assistant stream-json message contains
+// only text content blocks (no tool_use). When true, the model spoke
+// without invoking a tool — caller should clear any lingering tool
+// indicator since the previous tool round-trip has completed and the
+// model has resumed talking.
+func hasOnlyText(raw json.RawMessage) bool {
+	var msg struct {
+		Message json.RawMessage `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return false
+	}
+	var apiMsg struct {
+		Content []struct {
+			Type string `json:"type"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(msg.Message, &apiMsg); err != nil {
+		return false
+	}
+	if len(apiMsg.Content) == 0 {
+		return false
+	}
+	for _, c := range apiMsg.Content {
+		if c.Type != "text" {
+			return false
+		}
+	}
+	return true
 }
 
 // shortModelName strips the "claude-" prefix for display brevity.

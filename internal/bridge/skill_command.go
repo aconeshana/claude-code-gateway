@@ -400,7 +400,7 @@ func (b *Bridge) runSkill(ctx context.Context, m channel.InboundMessage) {
 	if userInput != "" {
 		prompt += "\n" + userInput
 	}
-	sess.SetLastInbound(m.ChatID, m.ThreadID, threadAnchorFromInbound(m))
+	sess.SetLastInbound(inboundLocationFrom(m))
 	if err := sess.SendMessage(prompt); err != nil {
 		card := b.buildSkillExecutedCard(name, userInput, false,
 			"发送到 session 失败: "+err.Error())

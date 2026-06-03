@@ -5,6 +5,7 @@ package fake
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/anthropics/claude-code-gateway/internal/channel"
@@ -12,13 +13,14 @@ import (
 
 // Channel is a test double for channel.Channel.
 type Channel struct {
-	mu       sync.Mutex
-	outbound []channel.OutboundMessage
-	updates  []Update
-	reacts   []Reaction
-	handler  channel.InboundHandler
-	started  bool
-	nextID   int
+	mu            sync.Mutex
+	outbound      []channel.OutboundMessage
+	updates       []Update
+	reacts        []Reaction
+	removedReacts []Reaction
+	handler       channel.InboundHandler
+	started       bool
+	nextID        int
 
 	// sendErrFunc, when set, lets tests inject an error per outbound call.
 	// Called with the OutboundMessage about to be sent; returning a non-nil
@@ -36,6 +38,7 @@ type Update struct {
 type Reaction struct {
 	MessageID string
 	Emoji     string
+	ID        string // populated by AddReaction; empty for add-only path
 }
 
 func New() *Channel { return &Channel{} }
@@ -112,9 +115,26 @@ func (c *Channel) OpenThread(ctx context.Context, anchorMsgID string, msg channe
 }
 
 func (c *Channel) Reaction(messageID, emoji string) error {
+	_, err := c.AddReaction(messageID, emoji)
+	return err
+}
+
+// AddReaction records the reaction and synthesizes a deterministic id so
+// tests can later assert RemoveReaction was called with the right pair.
+func (c *Channel) AddReaction(messageID, emoji string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.reacts = append(c.reacts, Reaction{MessageID: messageID, Emoji: emoji})
+	id := fmt.Sprintf("rxn-%d", len(c.reacts))
+	c.reacts = append(c.reacts, Reaction{MessageID: messageID, Emoji: emoji, ID: id})
+	return id, nil
+}
+
+// RemoveReaction records the cleanup as a Reaction entry with Emoji == ""
+// so test assertions can distinguish add-then-remove pairs by ID.
+func (c *Channel) RemoveReaction(messageID, reactionID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.removedReacts = append(c.removedReacts, Reaction{MessageID: messageID, ID: reactionID})
 	return nil
 }
 
@@ -155,6 +175,15 @@ func (c *Channel) Reactions() []Reaction {
 	defer c.mu.Unlock()
 	out := make([]Reaction, len(c.reacts))
 	copy(out, c.reacts)
+	return out
+}
+
+// RemovedReactions returns a copy of all RemoveReaction calls.
+func (c *Channel) RemovedReactions() []Reaction {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]Reaction, len(c.removedReacts))
+	copy(out, c.removedReacts)
 	return out
 }
 

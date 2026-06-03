@@ -579,7 +579,14 @@ func (b *Bridge) switchFocusTo(ctx context.Context, m channel.InboundMessage, se
 				} else {
 					info := priorFocus.Info()
 					if info.ThreadID != "" && info.RootMessageID != "" {
-						priorFocus.SetLastInbound(info.ChatID, info.ThreadID, info.RootMessageID)
+						// Restore prior focus's thread routing from saved info; we
+						// don't have the user's latest msg id here, so streamed
+						// output falls back to anchoring at the thread root.
+						priorFocus.SetLastInbound(session.InboundLocation{
+							ChatID:    info.ChatID,
+							ThreadID:  info.ThreadID,
+							RootMsgID: info.RootMessageID,
+						})
 					}
 				}
 			}
@@ -589,7 +596,11 @@ func (b *Bridge) switchFocusTo(ctx context.Context, m channel.InboundMessage, se
 			// to the thread on the next bot reply) and ping the thread so
 			// the main-chat 话题入口卡 surfaces a "new reply" indicator,
 			// letting the user know that session is alive somewhere else.
-			priorFocus.SetLastInbound(pInfo.ChatID, pInfo.ThreadID, pInfo.RootMessageID)
+			priorFocus.SetLastInbound(session.InboundLocation{
+				ChatID:    pInfo.ChatID,
+				ThreadID:  pInfo.ThreadID,
+				RootMsgID: pInfo.RootMessageID,
+			})
 			pingText := fmt.Sprintf("📌 主聊天 focus 已切走,在这里继续 [`%s`] · %s", displaySessionID(priorFocus), priorFocus.Label)
 			_, _ = b.ch.SendMessage(ctx, channel.OutboundMessage{
 				ChatID:           pInfo.ChatID,
@@ -732,9 +743,12 @@ func (b *Bridge) cmdArchive(ctx context.Context, m channel.InboundMessage, args 
 	prefix := strings.TrimSpace(args)
 	var sessionID string
 	if prefix == "" {
-		focused, ok := b.currentSession(m)
-		if !ok {
-			b.replyText(ctx, m, "没有 active session")
+		// /archive without args targets "the current session". Use the
+		// shared helper so idle/no-focus cases still resolve a target
+		// (archive is a metadata op — no need to spin the CLI up).
+		focused, err := b.ensureCurrentSession(ctx, m, false)
+		if err != nil {
+			b.replyText(ctx, m, err.Error())
 			return
 		}
 		sessionID = focused.ID
@@ -765,12 +779,21 @@ func (b *Bridge) cmdStop(ctx context.Context, m channel.InboundMessage, args str
 	if !ok {
 		return
 	}
+	// Mark BEFORE sending the interrupt so the renderer wins the race —
+	// CLI exit can fire its result event in microseconds and we don't
+	// want it processed as a genuine error on the way out.
+	sess.MarkInterrupted()
 	// Don't gate on session.State — our state lags the CLI: we mark Ready
 	// the moment a `result` event arrives, but the CLI may already be back
 	// in a follow-up tool round-trip. Just forward the interrupt; the CLI
 	// is the authority on whether there's a turn to cancel and silently
 	// no-ops if not.
 	if err := sess.SendControl(json.RawMessage(`{"subtype":"interrupt"}`)); err != nil {
+		// SendControl never reached the CLI — the interrupt didn't
+		// happen, so consume the flag back out. Otherwise the next
+		// unrelated CLI error (could be much later) would render as a
+		// neutral "Stopped" card and mask the real failure.
+		_ = sess.ConsumeInterruptedFlag()
 		b.replyText(ctx, m, "打断失败: "+err.Error())
 		return
 	}

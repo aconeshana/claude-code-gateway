@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
@@ -26,6 +27,12 @@ type Config struct {
 	AppID          string
 	AppSecret      string
 	AllowedUserIDs []string
+
+	// BotInfoCachePath is the on-disk location where the bot's own open_id
+	// is cached after the first successful /bot/v3/info call. Empty path
+	// skips caching (Start() then fetches every restart). The file holds a
+	// single line (the open_id, prefixed with ou_).
+	BotInfoCachePath string
 }
 
 // Channel implements channel.Channel using the Lark long-poll WebSocket API.
@@ -41,6 +48,13 @@ type Channel struct {
 	handler     channel.InboundHandler
 	allowedUIDs map[string]bool
 	dedup       map[string]struct{}
+
+	// botOpenID is this bot's own open_id, used to filter group-message
+	// mentions to "@ me only". Resolved at Start() via fetchBotOpenID,
+	// then cached on disk for subsequent restarts. Empty when the fetch
+	// failed — group mention filter then degrades to "any mention"
+	// (current legacy behavior) so the bot stays usable.
+	botOpenID string
 }
 
 // New constructs a Channel. Call Start(ctx, handler) to begin processing.
@@ -81,6 +95,8 @@ func (c *Channel) Start(ctx context.Context, handler channel.InboundHandler) err
 	c.handler = handler
 	c.mu.Unlock()
 
+	c.resolveBotOpenID(ctx)
+
 	disp := dispatcher.NewEventDispatcher("", "").
 		OnP2MessageReceiveV1(c.onMessageReceive).
 		OnP2CardActionTrigger(c.onCardAction)
@@ -91,11 +107,38 @@ func (c *Channel) Start(ctx context.Context, handler channel.InboundHandler) err
 	)
 
 	if len(c.allowedUIDs) > 0 {
-		log.Printf("[channel/feishu] starting (app_id=%s, allowed=%d)", c.cfg.AppID, len(c.allowedUIDs))
+		log.Printf("[channel/feishu] starting (app_id=%s, allowed=%d, bot_open_id=%s)",
+			c.cfg.AppID, len(c.allowedUIDs), shortID(c.botOpenID))
 	} else {
-		log.Printf("[channel/feishu] starting (app_id=%s, WARNING: no user allowlist)", c.cfg.AppID)
+		log.Printf("[channel/feishu] starting (app_id=%s, bot_open_id=%s, WARNING: no user allowlist)",
+			c.cfg.AppID, shortID(c.botOpenID))
 	}
 	return c.wsClient.Start(ctx)
+}
+
+// resolveBotOpenID populates c.botOpenID by reading the on-disk cache or,
+// when missing/empty, fetching from the Lark API and persisting the result.
+// All failures are non-fatal — leaving botOpenID empty degrades the group
+// mention check to the legacy "any mention" behavior, which is incorrect
+// but not broken.
+func (c *Channel) resolveBotOpenID(ctx context.Context) {
+	if cached := loadBotOpenIDFromCache(c.cfg.BotInfoCachePath); cached != "" {
+		c.botOpenID = cached
+		return
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	openID, err := fetchBotOpenID(fetchCtx, c.cfg.AppID, c.cfg.AppSecret)
+	if err != nil {
+		log.Printf("[channel/feishu] WARN: failed to resolve bot open_id: %v "+
+			"(group @ filter will accept any mention as fallback)", err)
+		return
+	}
+	c.botOpenID = openID
+	if err := saveBotOpenIDToCache(c.cfg.BotInfoCachePath, openID); err != nil {
+		log.Printf("[channel/feishu] WARN: cache bot open_id to %s failed: %v",
+			c.cfg.BotInfoCachePath, err)
+	}
 }
 
 func (c *Channel) Shutdown() {
@@ -105,7 +148,14 @@ func (c *Channel) Shutdown() {
 // SendMessage delivers an outbound message. Card takes precedence over Text.
 // When msg.ReplyToMessageID is non-empty, the Reply API is used so the
 // response lands in the same thread (or opens a new one if OpenThread=true).
+// When msg.MentionUserID is non-empty, the user is @-mentioned (Lark syntax)
+// inside the card's first markdown section or prepended to text content.
 func (c *Channel) SendMessage(ctx context.Context, msg channel.OutboundMessage) (string, error) {
+	textBody := msg.Text
+	if msg.MentionUserID != "" && msg.Text != "" {
+		textBody = larkAtTag(msg.MentionUserID) + " " + msg.Text
+	}
+
 	var (
 		msgType string
 		content string
@@ -113,10 +163,14 @@ func (c *Channel) SendMessage(ctx context.Context, msg channel.OutboundMessage) 
 	switch {
 	case msg.Card != nil:
 		msgType = "interactive"
-		content = renderCard(*msg.Card)
+		card := *msg.Card
+		if msg.MentionUserID != "" {
+			injectMentionIntoCard(&card, msg.MentionUserID)
+		}
+		content = renderCard(card)
 	case msg.Text != "":
 		msgType = "text"
-		raw, _ := json.Marshal(map[string]string{"text": msg.Text})
+		raw, _ := json.Marshal(map[string]string{"text": textBody})
 		content = string(raw)
 	default:
 		return "", fmt.Errorf("OutboundMessage has neither Card nor Text")
@@ -129,14 +183,51 @@ func (c *Channel) SendMessage(ctx context.Context, msg channel.OutboundMessage) 
 	if msgType == "interactive" {
 		return c.sendCard(ctx, string(msg.ChatID), content)
 	}
-	return "", c.sendText(ctx, string(msg.ChatID), msg.Text)
+	return "", c.sendText(ctx, string(msg.ChatID), textBody)
+}
+
+// larkAtTag returns the Lark @-mention tag for a user id. The id can be an
+// open_id (ou_*), user_id, or union_id — Lark's API resolves any of them.
+func larkAtTag(userID string) string {
+	return fmt.Sprintf(`<at user_id="%s"></at>`, userID)
+}
+
+// injectMentionIntoCard prepends a Lark @-mention tag to the card's first
+// markdown section. If no section has markdown, a new one is inserted at the
+// front.
+//
+// IMPORTANT: this mutates *card. The caller passes a local copy of the
+// underlying Card struct (via `card := *msg.Card`), but `card.Sections`
+// still shares the same backing slice as the caller's. We re-slice here
+// into a fresh array so writes through `card.Sections[i] = …` don't bleed
+// into the caller's Card — without this, the renderer's failure-fallback
+// path (update fails → send) would inject the at-tag twice.
+func injectMentionIntoCard(card *channel.Card, userID string) {
+	card.Sections = append([]channel.Section(nil), card.Sections...)
+	at := larkAtTag(userID) + " "
+	for i := range card.Sections {
+		if card.Sections[i].Markdown != "" {
+			// Shallow-copy: clone the section before mutating to avoid
+			// touching any shared underlying data.
+			s := card.Sections[i]
+			s.Markdown = at + s.Markdown
+			card.Sections[i] = s
+			return
+		}
+	}
+	// No markdown section yet — prepend one.
+	card.Sections = append([]channel.Section{{Markdown: at}}, card.Sections...)
 }
 
 func (c *Channel) UpdateMessage(ctx context.Context, messageID string, msg channel.OutboundMessage) error {
 	if msg.Card == nil {
 		return fmt.Errorf("UpdateMessage requires Card")
 	}
-	return c.updateCard(ctx, messageID, renderCard(*msg.Card))
+	card := *msg.Card
+	if msg.MentionUserID != "" {
+		injectMentionIntoCard(&card, msg.MentionUserID)
+	}
+	return c.updateCard(ctx, messageID, renderCard(card))
 }
 
 func (c *Channel) Reaction(messageID, emoji string) error {
@@ -145,6 +236,39 @@ func (c *Channel) Reaction(messageID, emoji string) error {
 	}
 	_, err := c.addReaction(messageID, emoji)
 	return err
+}
+
+// AddReaction adds the emoji reaction and returns the platform's
+// reaction id. Callers that want to clean up later (e.g. clear "OnIt"
+// when the agent finishes) must hold onto the id and pass it to
+// RemoveReaction.
+func (c *Channel) AddReaction(messageID, emoji string) (string, error) {
+	if messageID == "" {
+		return "", nil
+	}
+	return c.addReaction(messageID, emoji)
+}
+
+// RemoveReaction deletes a reaction by its platform id. Silently returns
+// nil when either arg is empty so callers can call this unconditionally.
+func (c *Channel) RemoveReaction(messageID, reactionID string) error {
+	if messageID == "" || reactionID == "" {
+		return nil
+	}
+	req := larkim.NewDeleteMessageReactionReqBuilder().
+		MessageId(messageID).
+		ReactionId(reactionID).
+		Build()
+	return c.withTokenRetry("removeReaction", func() (int, string, error) {
+		resp, err := c.client.Im.MessageReaction.Delete(context.Background(), req)
+		if err != nil {
+			return 0, "", err
+		}
+		if !resp.Success() {
+			return resp.Code, resp.Msg, nil
+		}
+		return 0, "", nil
+	})
 }
 
 // --- Lark SDK helpers ---
@@ -453,6 +577,7 @@ func (c *Channel) onMessageReceive(ctx context.Context, event *larkim.P2MessageR
 		UserID:      userID,
 		ChatID:      chatID,
 		MessageID:   msgID,
+		IsGroup:     chatType == "group",
 		ThreadID:    derefStr(msg.ThreadId),
 		RootID:      derefStr(msg.RootId),
 		ParentID:    derefStr(msg.ParentId),
@@ -476,7 +601,7 @@ func (c *Channel) onMessageReceive(ctx context.Context, event *larkim.P2MessageR
 			return nil
 		}
 		if chatType == "group" {
-			if msg.Mentions == nil || len(msg.Mentions) == 0 {
+			if !c.isMentionedInGroup(msg.Mentions) {
 				return nil
 			}
 			text = strings.TrimSpace(stripMentions(text))
@@ -511,6 +636,9 @@ func (c *Channel) onMessageReceive(ctx context.Context, event *larkim.P2MessageR
 		// Mention tags are flattened to their plain text (or dropped if
 		// they target the bot itself, mirroring the text branch).
 		text, imageKeys := parsePostContent(*msg.Content)
+		if chatType == "group" && !c.isMentionedInGroup(msg.Mentions) {
+			return nil
+		}
 		var blocks []interface{}
 		for _, key := range imageKeys {
 			block, err := c.imageKeyToBlock(msgID, key)
@@ -789,6 +917,30 @@ func parsePostContent(contentJSON string) (text string, imageKeys []string) {
 		}
 	}
 	return strings.TrimSpace(strings.Join(textParts, "\n")), imageKeys
+}
+
+// isMentionedInGroup decides whether to act on a group-chat message based
+// on its mentions. When we know our own bot open_id, only act when at
+// least one mention targets us — this prevents responding to messages
+// directed at other bots that happen to share the group. When the open
+// id is unknown (Start-time fetch failed), fall back to the legacy
+// "any mention" behavior so the bot stays usable.
+func (c *Channel) isMentionedInGroup(mentions []*larkim.MentionEvent) bool {
+	if len(mentions) == 0 {
+		return false
+	}
+	if c.botOpenID == "" {
+		return true // degraded fallback — see Start() warning log
+	}
+	for _, m := range mentions {
+		if m == nil || m.Id == nil || m.Id.OpenId == nil {
+			continue
+		}
+		if *m.Id.OpenId == c.botOpenID {
+			return true
+		}
+	}
+	return false
 }
 
 func stripMentions(text string) string {
