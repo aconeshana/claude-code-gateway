@@ -84,8 +84,9 @@ func newTestChannel(botOpenID string) *Channel {
 	return c
 }
 
-func TestGroupThread_NoMention_Dispatched(t *testing.T) {
-	// Regression: group thread message without @mention must be dispatched.
+func TestGroupThread_NoMention_Dropped(t *testing.T) {
+	// Group threads support multiple participants, so they follow the same
+	// @mention rule as the main group chat (rule 2). P2P threads are unaffected.
 	c := newTestChannel("ou_bot")
 	h := &captureHandler{}
 	c.mu.Lock()
@@ -96,15 +97,8 @@ func TestGroupThread_NoMention_Dispatched(t *testing.T) {
 	if err := c.onMessageReceive(context.Background(), ev); err != nil {
 		t.Fatalf("onMessageReceive: %v", err)
 	}
-	if h.count() != 1 {
-		t.Fatalf("expected 1 dispatch, got %d (group thread without @mention was dropped)", h.count())
-	}
-	msg, _ := h.last()
-	if msg.Text != "zerotier 好了没" {
-		t.Errorf("text = %q, want %q", msg.Text, "zerotier 好了没")
-	}
-	if msg.ThreadID != "omt_thread1" {
-		t.Errorf("ThreadID = %q, want omt_thread1", msg.ThreadID)
+	if h.count() != 0 {
+		t.Fatalf("expected 0 dispatches (group thread without @mention must be dropped), got %d", h.count())
 	}
 }
 
