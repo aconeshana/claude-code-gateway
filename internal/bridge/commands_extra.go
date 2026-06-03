@@ -105,12 +105,13 @@ func (b *Bridge) showModelMenu(ctx context.Context, m channel.InboundMessage) {
 			displaySessionID(target))
 	}
 
+	targetInfo := target.Info()
 	var btns []channel.Button
 	for _, mi := range availableModels {
 		btns = append(btns, channel.Button{
 			Label:  mi.Name,
 			Style:  "default",
-			Action: map[string]string{"action": "switch_model", "model": mi.Name, "session_id": target.ID},
+			Action: map[string]string{"action": "switch_model", "model": mi.Name, "session_id": sessionPayloadID(targetInfo)},
 		})
 	}
 	b.replyCard(ctx, m, channel.Card{
