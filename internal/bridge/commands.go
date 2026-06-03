@@ -582,10 +582,14 @@ func (b *Bridge) switchFocusTo(ctx context.Context, m channel.InboundMessage, se
 						// Restore prior focus's thread routing from saved info; we
 						// don't have the user's latest msg id here, so streamed
 						// output falls back to anchoring at the thread root.
+						// Preserve existing MsgID/UserID/IsGroup so in-flight
+						// group replies keep their @mention and quote anchor.
+						prior := priorFocus.LastInbound()
 						priorFocus.SetLastInbound(session.InboundLocation{
 							ChatID:    info.ChatID,
 							ThreadID:  info.ThreadID,
 							RootMsgID: info.RootMessageID,
+							MsgID:     prior.MsgID,
 							UserID:    m.UserID,
 							IsGroup:   m.IsGroup,
 						})
@@ -598,10 +602,13 @@ func (b *Bridge) switchFocusTo(ctx context.Context, m channel.InboundMessage, se
 			// to the thread on the next bot reply) and ping the thread so
 			// the main-chat 话题入口卡 surfaces a "new reply" indicator,
 			// letting the user know that session is alive somewhere else.
+			// Preserve MsgID so in-flight group replies keep their quote anchor.
+			prior := priorFocus.LastInbound()
 			priorFocus.SetLastInbound(session.InboundLocation{
 				ChatID:    pInfo.ChatID,
 				ThreadID:  pInfo.ThreadID,
 				RootMsgID: pInfo.RootMessageID,
+				MsgID:     prior.MsgID,
 				UserID:    m.UserID,
 				IsGroup:   m.IsGroup,
 			})
@@ -1271,7 +1278,33 @@ func (b *Bridge) handleCardAction(ctx context.Context, m channel.InboundMessage)
 			b.replyOrText(ctx, m, "已删除归档 "+b.displayIDFromGatewayID(id))
 		}
 	case "switch_model":
-		if model, ok := m.Action.Values["model"].(string); ok {
+		model, _ := m.Action.Values["model"].(string)
+		if model == "" {
+			return
+		}
+		sessID, _ := m.Action.Values["session_id"].(string)
+		if sess, ok := b.resolveSessionByPayload(sessID); ok {
+			// Session pinned at menu-render time — apply directly without
+			// re-running ensureCurrentSession (avoids TOCTOU if focus changed).
+			if err := sess.SwitchModel(model); err != nil {
+				b.replyModelResult(ctx, m, channel.Card{
+					Title:    "Switch Model · 失败",
+					Tone:     channel.ToneWarning,
+					Sections: []channel.Section{{Markdown: "切换模型失败: " + err.Error()}},
+				})
+				return
+			}
+			b.replyModelResult(ctx, m, channel.Card{
+				Title: "Switch Model · ✓ " + model,
+				Tone:  channel.ToneSuccess,
+				Sections: []channel.Section{{
+					Markdown: fmt.Sprintf("已切换 session **%s** 的模型为 `%s`",
+						displaySessionID(sess), model),
+				}},
+			})
+		} else {
+			// Fallback: session no longer exists (e.g. archived between menu
+			// render and click) — let cmdModel surface the error gracefully.
 			b.cmdModel(ctx, m, model)
 		}
 	case "edit_config":

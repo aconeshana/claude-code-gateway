@@ -13,6 +13,7 @@ import (
 
 	"github.com/anthropics/claude-code-gateway/internal/channel"
 	"github.com/anthropics/claude-code-gateway/internal/session"
+	"github.com/anthropics/claude-code-gateway/internal/shellexec"
 	"github.com/google/uuid"
 )
 
@@ -109,7 +110,7 @@ func (b *Bridge) showModelMenu(ctx context.Context, m channel.InboundMessage) {
 		btns = append(btns, channel.Button{
 			Label:  mi.Name,
 			Style:  "default",
-			Action: map[string]string{"action": "switch_model", "model": mi.Name},
+			Action: map[string]string{"action": "switch_model", "model": mi.Name, "session_id": target.ID},
 		})
 	}
 	b.replyCard(ctx, m, channel.Card{
@@ -584,7 +585,7 @@ func (b *Bridge) handleShell(ctx context.Context, m channel.InboundMessage, cmdS
 	execCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(execCtx, "sh", "-c", cmdStr)
+	cmd := shellexec.Command(execCtx, cmdStr)
 	cmd.Dir = wd
 
 	var stdout bytes.Buffer

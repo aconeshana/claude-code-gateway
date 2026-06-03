@@ -36,7 +36,7 @@ fail=0
 
 # ── 1. Block path patterns ─────────────────────────────────────────────────
 # Things that should never be committed regardless of content.
-block_paths='^(\.env|\.env\..+|.+\.(pem|key|p12|pfx|jks)|.+/(id_rsa|id_ed25519|id_ecdsa|id_dsa)|.+credentials\.json|.+/secrets\.(yml|yaml|json|toml)|gateway_state\.json|feishu_state\.json|.+\.discovery-cache\.json)$'
+block_paths='^(\.env|\.env\..+|.+\.(pem|key|p12|pfx|jks)|.+/(id_rsa|id_ed25519|id_ecdsa|id_dsa)|.+credentials\.json|.+/secrets\.(yml|yaml|json|toml)|(^|.+/)gateway_state\.json|(^|.+/)feishu_state\.json|.+\.discovery-cache\.json)$'
 bad_paths=$(echo "$staged" | grep -E "$block_paths" || true)
 if [[ -n "$bad_paths" ]]; then
   red "✘ pre-commit: refusing to track these path patterns:"
