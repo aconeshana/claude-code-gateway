@@ -102,6 +102,13 @@ func (b *Bridge) handleSessionEvent(ctx context.Context, sess *session.Session, 
 			// stop showing the placeholder gw:xxxx id.
 			state.sessionShort = displaySessionID(sess)
 			state.mu.Unlock()
+			// Messages sent while the CLI was still starting up (StateStarting)
+			// have been sitting in the OS pipe buffer; show an early progress
+			// card now so the user sees "Processing…" instead of silence for
+			// the ~40 s between ✅ reaction and the eventual Done card.
+			if sess.Info().PendingTurns > 0 {
+				state.ensureProgressCard(ctx, b, chatID)
+			}
 		}
 	case protocol.MsgTypeAssistant:
 		// Extract usage from the last API response to track context window usage.
@@ -119,6 +126,11 @@ func (b *Bridge) handleSessionEvent(ctx context.Context, sess *session.Session, 
 			state.setCurrentTool(toolLabel)
 		} else if hasOnlyText(raw) {
 			state.setCurrentTool("")
+		}
+		if items := extractTodoItems(raw); items != nil {
+			state.mu.Lock()
+			state.todos = items
+			state.mu.Unlock()
 		}
 		text := extractAssistantText(raw)
 		if text != "" {
@@ -168,6 +180,10 @@ type streamState struct {
 	lastEvent     time.Time // most recent event (text/tool/etc.) for "Ys ago"
 	currentTool   string    // e.g. "Bash · tcpdump…" (empty between tools)
 	heartbeatStop chan struct{}
+
+	// Session-level todo list; updated on every TodoWrite call and persists
+	// across turns so the Done card always shows the latest state.
+	todos []todoItem
 }
 
 // startHeartbeat ensures a background goroutine is re-rendering the
@@ -227,7 +243,7 @@ func (s *streamState) renderHeartbeat(ctx context.Context, b *Bridge, chatID str
 	if content == "" {
 		content = "_(thinking · running tool…)_"
 	}
-	card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.turnStart, s.lastEvent)
+	card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.todos, s.turnStart, s.lastEvent)
 	s.mu.Unlock()
 	_ = b.updateCard(ctx, msgID, card)
 }
@@ -267,7 +283,7 @@ func (s *streamState) ensureProgressCard(ctx context.Context, b *Bridge, chatID 
 	// Empty body — the HUD note carries everything user-visible
 	// (current tool, elapsed). The body fills in once assistant text
 	// arrives.
-	card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, "_(thinking · running tool…)_", s.currentTool, s.turnStart, s.lastEvent)
+	card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, "_(thinking · running tool…)_", s.currentTool, s.todos, s.turnStart, s.lastEvent)
 	s.mu.Unlock()
 
 	msgID, err := b.sendCardForSession(ctx, s.sess, chatID, card)
@@ -312,7 +328,7 @@ func (s *streamState) appendText(ctx context.Context, b *Bridge, chatID, text st
 
 	if s.messageID == "" {
 		content := truncate(s.textBuf.String())
-		card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.turnStart, s.lastEvent)
+		card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.todos, s.turnStart, s.lastEvent)
 		msgID, err := b.sendCardForSession(ctx, s.sess, chatID, card)
 		if err != nil {
 			return
@@ -344,7 +360,7 @@ func (s *streamState) appendText(ctx context.Context, b *Bridge, chatID, text st
 		}
 		s.timer = nil
 		content := truncate(s.textBuf.String())
-		card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.turnStart, s.lastEvent)
+		card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.todos, s.turnStart, s.lastEvent)
 		_ = b.updateCard(ctx, s.messageID, card)
 		s.lastUpdate = time.Now()
 		s.dirty = false
@@ -367,6 +383,7 @@ func (s *streamState) finalize(ctx context.Context, b *Bridge, chatID string, re
 	model := s.model
 	gitBranch := s.gitBranch
 	contextPct := s.contextPct
+	todos := s.todos
 	s.mu.Unlock()
 
 	if result.IsError && msgID == "" && buffered == "" {
@@ -392,7 +409,7 @@ func (s *streamState) finalize(ctx context.Context, b *Bridge, chatID string, re
 	// scary red "Error".
 	interrupted := s.sess != nil && s.sess.ConsumeInterruptedFlag()
 
-	card := b.resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch, contextPct, content, result, interrupted)
+	card := b.resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch, contextPct, content, todos, result, interrupted)
 	if msgID != "" {
 		if err := b.updateFinalCardForSession(ctx, msgID, s.sess, card); err != nil {
 			_, _ = b.sendFinalCardForSession(ctx, s.sess, chatID, card)
@@ -439,7 +456,7 @@ func (b *Bridge) processingCard(project, summary, model, gitBranch string, conte
 // suffix lets users running multiple parallel sessions identify which card
 // belongs to which session at a glance, and copy the id for /switch.
 func (b *Bridge) processingCardWithID(project, sessionShort, summary, model, gitBranch string, contextPct int, content string) channel.Card {
-	return b.processingCardWithProgress(project, sessionShort, summary, model, gitBranch, contextPct, content, "", time.Time{}, time.Time{})
+	return b.processingCardWithProgress(project, sessionShort, summary, model, gitBranch, contextPct, content, "", nil, time.Time{}, time.Time{})
 }
 
 // processingCardWithProgress is the full-fat variant used by streamSession
@@ -447,7 +464,7 @@ func (b *Bridge) processingCardWithID(project, sessionShort, summary, model, git
 // (current tool, turn-start, last-event) woven into the HUD note so a
 // user staring at the card for 17 minutes can tell whether the agent is
 // still working or stuck.
-func (b *Bridge) processingCardWithProgress(project, sessionShort, summary, model, gitBranch string, contextPct int, content, currentTool string, turnStart, lastEvent time.Time) channel.Card {
+func (b *Bridge) processingCardWithProgress(project, sessionShort, summary, model, gitBranch string, contextPct int, content, currentTool string, todos []todoItem, turnStart, lastEvent time.Time) channel.Card {
 	title := "Processing"
 	if project != "" {
 		title += ": " + project
@@ -460,13 +477,15 @@ func (b *Bridge) processingCardWithProgress(project, sessionShort, summary, mode
 	if summary != "" {
 		note = summary + " | " + hud
 	}
+	sections := []channel.Section{{Markdown: content}}
+	if md := renderTodosMarkdown(todos); md != "" {
+		sections = append(sections, channel.Section{Markdown: md})
+	}
+	sections = append(sections, channel.Section{Note: note})
 	return channel.Card{
-		Title: title,
-		Tone:  channel.ToneInfo,
-		Sections: []channel.Section{
-			{Markdown: content},
-			{Note: note},
-		},
+		Title:    title,
+		Tone:     channel.ToneInfo,
+		Sections: sections,
 	}
 }
 
@@ -475,13 +494,13 @@ func (b *Bridge) resultCard(project, summary, model, gitBranch string, contextPc
 }
 
 func (b *Bridge) resultCardWithID(project, sessionShort, summary, model, gitBranch string, contextPct int, content string, result *protocol.ResultMessage) channel.Card {
-	return b.resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch, contextPct, content, result, false)
+	return b.resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch, contextPct, content, nil, result, false)
 }
 
 // resultCardWithIDAndInterrupt is the parameterized form used by streamSession.
 // interrupted=true means /stop fired before the CLI exited; render as a neutral
 // "Stopped" card instead of a red "Error" card so the UX matches user intent.
-func (b *Bridge) resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch string, contextPct int, content string, result *protocol.ResultMessage, interrupted bool) channel.Card {
+func (b *Bridge) resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch string, contextPct int, content string, todos []todoItem, result *protocol.ResultMessage, interrupted bool) channel.Card {
 	title := "Done"
 	tone := channel.ToneSuccess
 	switch {
@@ -506,13 +525,15 @@ func (b *Bridge) resultCardWithIDAndInterrupt(project, sessionShort, summary, mo
 	if summary != "" {
 		note = summary + " | " + hud
 	}
+	sections := []channel.Section{{Markdown: content}}
+	if md := renderTodosMarkdown(todos); md != "" {
+		sections = append(sections, channel.Section{Markdown: md})
+	}
+	sections = append(sections, channel.Section{Divider: true, Note: note})
 	return channel.Card{
-		Title: title,
-		Tone:  tone,
-		Sections: []channel.Section{
-			{Markdown: content},
-			{Divider: true, Note: note},
-		},
+		Title:    title,
+		Tone:     tone,
+		Sections: sections,
 	}
 }
 
@@ -618,6 +639,74 @@ func formatShortDuration(d time.Duration) string {
 		return fmt.Sprintf("%dh", h)
 	}
 	return fmt.Sprintf("%dh%dm", h, m)
+}
+
+// todoItem mirrors a single entry from Claude Code's TodoWrite tool output.
+type todoItem struct {
+	Content string
+	Status  string // "pending", "in_progress", "completed"
+}
+
+// extractTodoItems returns the todo list written by a TodoWrite tool_use block
+// in an assistant message, or nil when no TodoWrite call is present.
+func extractTodoItems(raw json.RawMessage) []todoItem {
+	var msg struct {
+		Message json.RawMessage `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return nil
+	}
+	var apiMsg struct {
+		Content []struct {
+			Type  string          `json:"type"`
+			Name  string          `json:"name"`
+			Input json.RawMessage `json:"input"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(msg.Message, &apiMsg); err != nil {
+		return nil
+	}
+	for i := len(apiMsg.Content) - 1; i >= 0; i-- {
+		c := apiMsg.Content[i]
+		if c.Type != "tool_use" || c.Name != "TodoWrite" {
+			continue
+		}
+		var input struct {
+			Todos []struct {
+				Content string `json:"content"`
+				Status  string `json:"status"`
+			} `json:"todos"`
+		}
+		if err := json.Unmarshal(c.Input, &input); err != nil {
+			return nil
+		}
+		items := make([]todoItem, 0, len(input.Todos))
+		for _, t := range input.Todos {
+			items = append(items, todoItem{Content: t.Content, Status: t.Status})
+		}
+		return items
+	}
+	return nil
+}
+
+// renderTodosMarkdown converts a todo list to a Markdown string using emoji
+// status indicators. Returns "" when the slice is empty.
+func renderTodosMarkdown(todos []todoItem) string {
+	if len(todos) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for _, t := range todos {
+		switch t.Status {
+		case "completed":
+			fmt.Fprintf(&sb, "✅ ~~%s~~\n", t.Content)
+		case "in_progress":
+			fmt.Fprintf(&sb, "⏳ **%s**\n", t.Content)
+		default:
+			fmt.Fprintf(&sb, "🔲 %s\n", t.Content)
+		}
+	}
+	return strings.TrimRight(sb.String(), "\n")
 }
 
 // extractCurrentTool finds the most recent tool_use block in an assistant
