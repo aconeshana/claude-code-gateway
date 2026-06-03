@@ -600,10 +600,20 @@ func (c *Channel) onMessageReceive(ctx context.Context, event *larkim.P2MessageR
 		if text == "" {
 			return nil
 		}
-		if chatType == "group" {
+		if chatType == "group" && inbound.ThreadID == "" {
+			// Thread messages bypass the @mention requirement: the user is
+			// already inside a bot-session thread, so every message in that
+			// thread is implicitly directed at the bot.
 			if !c.isMentionedInGroup(msg.Mentions) {
 				return nil
 			}
+			text = strings.TrimSpace(stripMentions(text))
+			if text == "" {
+				return nil
+			}
+		} else if chatType == "group" && inbound.ThreadID != "" {
+			// Strip @bot mentions even in thread messages so the bot doesn't
+			// see its own mention tag as part of the user's input.
 			text = strings.TrimSpace(stripMentions(text))
 			if text == "" {
 				return nil
@@ -636,7 +646,7 @@ func (c *Channel) onMessageReceive(ctx context.Context, event *larkim.P2MessageR
 		// Mention tags are flattened to their plain text (or dropped if
 		// they target the bot itself, mirroring the text branch).
 		text, imageKeys := parsePostContent(*msg.Content)
-		if chatType == "group" && !c.isMentionedInGroup(msg.Mentions) {
+		if chatType == "group" && inbound.ThreadID == "" && !c.isMentionedInGroup(msg.Mentions) {
 			return nil
 		}
 		var blocks []interface{}
