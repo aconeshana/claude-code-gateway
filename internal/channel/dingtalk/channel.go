@@ -132,6 +132,16 @@ func (c *Channel) Reaction(messageID, emoji string) error {
 	return nil
 }
 
+// AddReaction is a no-op for DingTalk — see Reaction.
+func (c *Channel) AddReaction(messageID, emoji string) (string, error) {
+	return "", nil
+}
+
+// RemoveReaction is a no-op for DingTalk — see Reaction.
+func (c *Channel) RemoveReaction(messageID, reactionID string) error {
+	return nil
+}
+
 // --- DingTalk Stream handlers ---
 
 const cardActionPrefix = "__card_action__:"
@@ -173,15 +183,17 @@ func (c *Channel) onChatBotMessage(ctx context.Context, data *chatbot.BotCallbac
 		text = stripAtMention(text)
 	}
 
+	isGroup := data.ConversationType == "2"
+
 	// Handle picture messages: download image and forward as InputBlocks.
 	if data.Msgtype == "picture" {
-		c.handleImageMessage(ctx, data, userID, chatID, msgID, text)
+		c.handleImageMessage(ctx, data, userID, chatID, msgID, text, isGroup)
 		return nil, nil
 	}
 
 	// Handle richText messages (image + text combo).
 	if data.Msgtype == "richText" {
-		c.handleRichTextMessage(ctx, data, userID, chatID, msgID, text)
+		c.handleRichTextMessage(ctx, data, userID, chatID, msgID, text, isGroup)
 		return nil, nil
 	}
 
@@ -204,6 +216,7 @@ func (c *Channel) onChatBotMessage(ctx context.Context, data *chatbot.BotCallbac
 		UserID:      userID,
 		ChatID:      chatID,
 		MessageID:   msgID,
+		IsGroup:     data.ConversationType == "2",
 		Kind:        channel.InputText,
 		Text:        text,
 	}
@@ -465,14 +478,14 @@ func (c *Channel) doSendViaOpenAPI(ctx context.Context, chatID string, msgJSON s
 
 // handleImageMessage downloads the image via OpenAPI and forwards it as
 // InputBlocks (same format as Feishu: base64-encoded image block).
-func (c *Channel) handleImageMessage(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, chatID, msgID, caption string) {
+func (c *Channel) handleImageMessage(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, chatID, msgID, caption string, isGroup bool) {
 	downloadCode := extractDownloadCode(data.Content)
 	if downloadCode == "" {
 		log.Printf("[channel/dingtalk] picture message without downloadCode, msgID=%s", shortID(msgID))
 		if caption != "" {
 			c.dispatch(ctx, channel.InboundMessage{
 				ChannelKind: "dingtalk", UserID: userID, ChatID: chatID,
-				MessageID: msgID, Kind: channel.InputText, Text: caption,
+				MessageID: msgID, IsGroup: isGroup, Kind: channel.InputText, Text: caption,
 			})
 		}
 		return
@@ -483,7 +496,7 @@ func (c *Channel) handleImageMessage(ctx context.Context, data *chatbot.BotCallb
 		log.Printf("[channel/dingtalk] image download failed: %v", err)
 		c.dispatch(ctx, channel.InboundMessage{
 			ChannelKind: "dingtalk", UserID: userID, ChatID: chatID,
-			MessageID: msgID, Kind: channel.InputText, Text: "[图片下载失败] " + caption,
+			MessageID: msgID, IsGroup: isGroup, Kind: channel.InputText, Text: "[图片下载失败] " + caption,
 		})
 		return
 	}
@@ -512,6 +525,7 @@ func (c *Channel) handleImageMessage(ctx context.Context, data *chatbot.BotCallb
 		UserID:      userID,
 		ChatID:      chatID,
 		MessageID:   msgID,
+		IsGroup:     isGroup,
 		Kind:        channel.InputBlocks,
 		Blocks:      blocks,
 	})
@@ -521,7 +535,7 @@ func (c *Channel) handleImageMessage(ctx context.Context, data *chatbot.BotCallb
 // text and images. DingTalk richText Content is typically:
 //
 //	{"richText":[{"text":"..."},{"downloadCode":"xxx","type":"picture"}]}
-func (c *Channel) handleRichTextMessage(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, chatID, msgID, caption string) {
+func (c *Channel) handleRichTextMessage(ctx context.Context, data *chatbot.BotCallbackDataModel, userID, chatID, msgID, caption string, isGroup bool) {
 	texts, downloadCodes := parseRichTextContent(data.Content)
 
 	// Combine any inline text with the caption from data.Text.Content
@@ -542,7 +556,7 @@ func (c *Channel) handleRichTextMessage(ctx context.Context, data *chatbot.BotCa
 		}
 		c.dispatch(ctx, channel.InboundMessage{
 			ChannelKind: "dingtalk", UserID: userID, ChatID: chatID,
-			MessageID: msgID, Kind: channel.InputText, Text: allText,
+			MessageID: msgID, IsGroup: isGroup, Kind: channel.InputText, Text: allText,
 		})
 		return
 	}
@@ -573,7 +587,7 @@ func (c *Channel) handleRichTextMessage(ctx context.Context, data *chatbot.BotCa
 	if len(blocks) == 0 {
 		c.dispatch(ctx, channel.InboundMessage{
 			ChannelKind: "dingtalk", UserID: userID, ChatID: chatID,
-			MessageID: msgID, Kind: channel.InputText, Text: "[图片下载失败]",
+			MessageID: msgID, IsGroup: isGroup, Kind: channel.InputText, Text: "[图片下载失败]",
 		})
 		return
 	}
@@ -581,7 +595,7 @@ func (c *Channel) handleRichTextMessage(ctx context.Context, data *chatbot.BotCa
 	log.Printf("[channel/dingtalk] richText msg user=%s texts=%d images=%d", shortID(userID), len(texts), len(downloadCodes))
 	c.dispatch(ctx, channel.InboundMessage{
 		ChannelKind: "dingtalk", UserID: userID, ChatID: chatID,
-		MessageID: msgID, Kind: channel.InputBlocks, Blocks: blocks,
+		MessageID: msgID, IsGroup: isGroup, Kind: channel.InputBlocks, Blocks: blocks,
 	})
 }
 

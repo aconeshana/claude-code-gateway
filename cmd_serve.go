@@ -87,9 +87,10 @@ func cmdServe() {
 		mgr.SetSummaryStore(store)
 
 		feiCh := feishuCh.New(feishuCh.Config{
-			AppID:          cfg.Feishu.AppID,
-			AppSecret:      cfg.Feishu.AppSecret,
-			AllowedUserIDs: cfg.Feishu.AllowedUserIDs,
+			AppID:            cfg.Feishu.AppID,
+			AppSecret:        cfg.Feishu.AppSecret,
+			AllowedUserIDs:   cfg.Feishu.AllowedUserIDs,
+			BotInfoCachePath: filepath.Join(filepath.Dir(statePath), "feishu_bot_"+cfg.Feishu.AppID+".openid"),
 		})
 		discoverer := claude.NewDiscoverer("", "")
 		newBridge = bridge.New(bridge.Options{

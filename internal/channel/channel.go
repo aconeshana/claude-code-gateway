@@ -44,7 +44,22 @@ type Channel interface {
 
 	// Reaction adds a reaction emoji to a message. Implementations that do
 	// not support reactions may treat this as a no-op.
+	//
+	// Deprecated: callers that need to clear the reaction on completion
+	// should use AddReaction (returns the platform-side reaction id) and
+	// RemoveReaction. Reaction is retained for fire-and-forget call sites
+	// that don't track the lifecycle.
 	Reaction(messageID, emoji string) error
+
+	// AddReaction is like Reaction but returns the platform-side reaction
+	// id so the caller can RemoveReaction(messageID, reactionID) later.
+	// Empty reactionID with nil error means the channel doesn't surface a
+	// removable handle (best-effort cleanup not possible).
+	AddReaction(messageID, emoji string) (reactionID string, err error)
+
+	// RemoveReaction deletes a previously added reaction. No-op when
+	// reactionID is "" or the platform doesn't support reaction removal.
+	RemoveReaction(messageID, reactionID string) error
 }
 
 // InboundHandler receives messages delivered via Channel.Start.
@@ -95,6 +110,12 @@ type InboundMessage struct {
 	MessageID   string
 	Kind        InputKind
 
+	// IsGroup distinguishes group chats from 1-on-1 (P2P) conversations.
+	// Bridges use this to gate group-only UX (quote-reply, @-mention) so
+	// P2P chats stay quiet and uncluttered. Channels that don't expose a
+	// distinction (or that only support one mode) should leave this false.
+	IsGroup bool
+
 	Text   string        // populated for InputText
 	Blocks []interface{} // populated for InputBlocks / InputImage
 	Action *CardAction   // populated for InputCardAction
@@ -115,6 +136,15 @@ type InboundMessage struct {
 	// UpdateMessage asynchronously, the client may revert to the original
 	// card before the update arrives. Calling Reply guarantees the
 	// returned card replaces the source card atomically.
+	//
+	// CONTRACT: this path takes Card directly, NOT OutboundMessage. That
+	// means OutboundMessage.MentionUserID (@-mention injection) and the
+	// other transport-level extensions cannot ride through here. Callers
+	// that need @-mention should use Bridge.sendCardForSession /
+	// updateFinalCardForSession instead — those go through Channel.SendMessage
+	// / UpdateMessage where the channel injects the at-tag from MentionUserID.
+	// In practice m.Reply is only used for short command/system responses
+	// where @ would be redundant push spam, so this restriction is benign.
 	//
 	// nil for platforms/event-kinds that don't support synchronous replies.
 	Reply func(Card)
@@ -150,6 +180,17 @@ type OutboundMessage struct {
 	// ReplyToMessageID. Only meaningful when ReplyToMessageID is set and the
 	// platform supports threads.
 	OpenThread bool
+
+	// MentionUserID, when non-empty, asks the channel to @-mention the given
+	// user inside the message (Lark: `<at user_id="ou_xxx">` injected into
+	// the first markdown section of the card, or prepended to text content).
+	// Bridges should only set this when the @ adds value (group chats,
+	// final agent replies) — channels render it verbatim, so over-using it
+	// produces notification spam.
+	// On platforms without a stable @ syntax (e.g. DingTalk), this is
+	// silently ignored. The id format must match the platform's user-id
+	// space (Lark: open_id / user_id / union_id).
+	MentionUserID string
 }
 
 // Tone describes the visual style of a card. Implementations map this to a

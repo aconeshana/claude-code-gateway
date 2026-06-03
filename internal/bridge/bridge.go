@@ -258,10 +258,10 @@ func (b *Bridge) handleText(ctx context.Context, m channel.InboundMessage) {
 	// Record where this message came from so streamSession can post the
 	// bot's reply back to the same location (main chat vs Lark thread)
 	// instead of the session's pinned thread.
-	sess.SetLastInbound(m.ChatID, m.ThreadID, threadAnchorFromInbound(m))
+	sess.SetLastInbound(inboundLocationFrom(m))
 	b.ensureSubscribed(ctx, sess, m)
 
-	_ = b.ch.Reaction(m.MessageID, "OnIt")
+	b.markPendingOnIt(sess, m.MessageID)
 
 	if err := sess.SendMessage(text); err != nil {
 		b.replyText(ctx, m, "发送消息失败: "+err.Error())
@@ -280,10 +280,10 @@ func (b *Bridge) handleBlocks(ctx context.Context, m channel.InboundMessage) {
 	if !ok {
 		return
 	}
-	sess.SetLastInbound(m.ChatID, m.ThreadID, threadAnchorFromInbound(m))
+	sess.SetLastInbound(inboundLocationFrom(m))
 	b.ensureSubscribed(ctx, sess, m)
 
-	_ = b.ch.Reaction(m.MessageID, "OnIt")
+	b.markPendingOnIt(sess, m.MessageID)
 
 	if err := sess.SendMessageBlocks(m.Blocks); err != nil {
 		b.replyText(ctx, m, "发送图片消息失败: "+err.Error())
@@ -474,6 +474,26 @@ func (b *Bridge) updateCard(ctx context.Context, messageID string, card channel.
 	return nil
 }
 
+// updateFinalCardForSession is the UpdateMessage counterpart of
+// sendFinalCardForSession: same @-mention policy (group + known asker
+// → @ the asker), used by the renderer when the Done card replaces an
+// existing progress card via Lark's edit-in-place API rather than
+// creating a brand-new message.
+func (b *Bridge) updateFinalCardForSession(ctx context.Context, messageID string, sess *session.Session, card channel.Card) error {
+	out := channel.OutboundMessage{Card: &card}
+	if sess != nil {
+		if loc := sess.LastInbound(); loc.IsGroup && loc.UserID != "" {
+			out.MentionUserID = loc.UserID
+		}
+	}
+	if err := b.ch.UpdateMessage(ctx, messageID, out); err != nil {
+		log.Printf("[bridge] updateFinalCardForSession failed: %v (msg=%s mention=%s)",
+			err, shortID(messageID), shortID(out.MentionUserID))
+		return err
+	}
+	return nil
+}
+
 // --- Thread-aware outbound helpers ---
 //
 // Use replyText/replyCard for messages produced in response to an inbound
@@ -488,7 +508,7 @@ func (b *Bridge) updateCard(ctx context.Context, messageID string, card channel.
 
 func (b *Bridge) replyText(ctx context.Context, m channel.InboundMessage, text string) {
 	out := channel.OutboundMessage{ChatID: m.ChatID, Text: text}
-	if m.ThreadID != "" && m.MessageID != "" {
+	if shouldUseReplyAPI(m) {
 		out.ReplyToMessageID = m.MessageID
 	}
 	if _, err := b.ch.SendMessage(ctx, out); err != nil {
@@ -505,7 +525,7 @@ func (b *Bridge) replyText(ctx context.Context, m channel.InboundMessage, text s
 
 func (b *Bridge) replyCard(ctx context.Context, m channel.InboundMessage, card channel.Card) (string, error) {
 	out := channel.OutboundMessage{ChatID: m.ChatID, Card: &card}
-	if m.ThreadID != "" && m.MessageID != "" {
+	if shouldUseReplyAPI(m) {
 		out.ReplyToMessageID = m.MessageID
 	}
 	id, err := b.ch.SendMessage(ctx, out)
@@ -534,20 +554,94 @@ func threadAnchorFromInbound(m channel.InboundMessage) string {
 	return m.MessageID
 }
 
+// shouldUseReplyAPI decides whether replyCard/replyText should pin the
+// outbound to the user's inbound message via the platform's Reply API.
+//
+// Two scenarios warrant this:
+//   - The user spoke inside a Lark thread → reply must stay in the thread
+//     (the Reply API is the only mechanism that does this).
+//   - The user spoke in a group main chat → reply gets a quote bubble that
+//     anchors bot output to a specific question (UX nicety; cluttered group
+//     chats are unreadable without it).
+//
+// P2P / 1-on-1 chats are deliberately excluded — there is no ambiguity
+// about who the bot is replying to, and the quote bubble adds visual noise.
+//
+// Note: replyCard/replyText deliberately do NOT set MentionUserID. They
+// carry short command responses and system notifications ("auto-resumed
+// session X") where an @ would be redundant push spam — the user just
+// typed something and their attention is already on the chat. @-mention
+// is reserved for the agent's Done card (handled by sendFinalCardForSession
+// and updateFinalCardForSession), which can arrive minutes after the
+// user walked away.
+func shouldUseReplyAPI(m channel.InboundMessage) bool {
+	if m.MessageID == "" {
+		return false
+	}
+	return m.ThreadID != "" || m.IsGroup
+}
+
+// inboundLocationFrom projects an InboundMessage into the session-level
+// routing context. Used wherever the bridge records "where this user spoke"
+// for later streamed-output routing.
+func inboundLocationFrom(m channel.InboundMessage) session.InboundLocation {
+	return session.InboundLocation{
+		ChatID:    m.ChatID,
+		ThreadID:  m.ThreadID,
+		RootMsgID: threadAnchorFromInbound(m),
+		MsgID:     m.MessageID,
+		UserID:    m.UserID,
+		IsGroup:   m.IsGroup,
+	}
+}
+
+// markPendingOnIt adds the "OnIt" reaction to the user's message and
+// records the resulting reaction id on the session so the renderer can
+// clear it when the agent finishes. If the session already has a pending
+// reaction from a prior turn, that one is cleared first (1-slot LRU —
+// users sending rapid-fire messages don't accumulate stale acknowledgers).
+//
+// Fires in BOTH P2P and group: OnIt is "I see you, working on it"
+// feedback — orthogonal to the quote-reply / @-mention UX class which
+// is group-only. P2P users equally rely on the visual cue, especially
+// when the agent's first response is a long tool call (Bash, Grep)
+// rather than immediate text — without OnIt, P2P users would see
+// silence for minutes before the first assistant chunk lands.
+func (b *Bridge) markPendingOnIt(sess *session.Session, msgID string) {
+	if msgID == "" {
+		return
+	}
+	if prevMsg, prevID := sess.PendingReaction(); prevMsg != "" && prevID != "" {
+		_ = b.ch.RemoveReaction(prevMsg, prevID)
+	}
+	id, err := b.ch.AddReaction(msgID, "OnIt")
+	if err != nil {
+		log.Printf("[bridge] add OnIt failed (msg=%s): %v", shortID(msgID), err)
+		sess.SetPendingReaction("", "")
+		return
+	}
+	sess.SetPendingReaction(msgID, id)
+}
+
+// clearPendingReaction removes the pending OnIt reaction (if any) and
+// resets the session's tracking. Called by the renderer after the Done
+// card is dispatched.
+func (b *Bridge) clearPendingReaction(sess *session.Session) {
+	msgID, reactionID := sess.PendingReaction()
+	if msgID == "" || reactionID == "" {
+		return
+	}
+	if err := b.ch.RemoveReaction(msgID, reactionID); err != nil {
+		log.Printf("[bridge] remove OnIt failed (msg=%s, rxn=%s): %v",
+			shortID(msgID), shortID(reactionID), err)
+	}
+	sess.SetPendingReaction("", "")
+}
+
 func (b *Bridge) sendTextForSession(ctx context.Context, sess *session.Session, chatID, text string) {
 	out := channel.OutboundMessage{ChatID: chatID, Text: text}
 	if sess != nil {
-		if liChatID, _, liRootMsgID := sess.LastInbound(); liChatID != "" {
-			// Follow user's most recent location instead of the session's
-			// pinned thread binding. Empty rootMsgID = main chat reply.
-			out.ChatID = liChatID
-			out.ReplyToMessageID = liRootMsgID
-		} else if anchor := sess.Info().RootMessageID; anchor != "" {
-			// No inbound location yet (rare — output before any user
-			// message). Fall back to the session's pinned thread so the
-			// thread entry card sees the new reply.
-			out.ReplyToMessageID = anchor
-		}
+		applyStreamingAnchor(&out, sess)
 	}
 	if _, err := b.ch.SendMessage(ctx, out); err != nil {
 		if b.handleOutboundError(ctx, sess, out.ChatID, err) {
@@ -561,12 +655,7 @@ func (b *Bridge) sendTextForSession(ctx context.Context, sess *session.Session, 
 func (b *Bridge) sendCardForSession(ctx context.Context, sess *session.Session, chatID string, card channel.Card) (string, error) {
 	out := channel.OutboundMessage{ChatID: chatID, Card: &card}
 	if sess != nil {
-		if liChatID, _, liRootMsgID := sess.LastInbound(); liChatID != "" {
-			out.ChatID = liChatID
-			out.ReplyToMessageID = liRootMsgID
-		} else if anchor := sess.Info().RootMessageID; anchor != "" {
-			out.ReplyToMessageID = anchor
-		}
+		applyStreamingAnchor(&out, sess)
 	}
 	id, err := b.ch.SendMessage(ctx, out)
 	if err != nil {
@@ -580,6 +669,76 @@ func (b *Bridge) sendCardForSession(ctx context.Context, sess *session.Session, 
 		log.Printf("[bridge] sendCardForSession ok: session=%s msgID=%s anchor=%s", displaySessionID(sess), shortID(id), shortID(out.ReplyToMessageID))
 	}
 	return id, err
+}
+
+// sendFinalCardForSession is a variant of sendCardForSession used for the
+// last card of an agent turn (Done / Error). In group chats it additionally
+// @-mentions the user who asked the question, so they get a strong
+// notification on completion without spamming intermediate cards.
+//
+// All other behavior (quote anchoring, chat routing, error fallback) is
+// identical to sendCardForSession.
+func (b *Bridge) sendFinalCardForSession(ctx context.Context, sess *session.Session, chatID string, card channel.Card) (string, error) {
+	out := channel.OutboundMessage{ChatID: chatID, Card: &card}
+	if sess != nil {
+		applyStreamingAnchor(&out, sess)
+		if loc := sess.LastInbound(); loc.IsGroup && loc.UserID != "" {
+			out.MentionUserID = loc.UserID
+		}
+	}
+	id, err := b.ch.SendMessage(ctx, out)
+	if err != nil {
+		if b.handleOutboundError(ctx, sess, out.ChatID, err) {
+			id, err = b.ch.SendMessage(ctx, channel.OutboundMessage{ChatID: out.ChatID, Card: &card})
+		}
+		if err != nil {
+			log.Printf("[bridge] sendFinalCardForSession failed: %v (session=%s anchor=%s)", err, displaySessionID(sess), shortID(out.ReplyToMessageID))
+		}
+	} else {
+		log.Printf("[bridge] sendFinalCardForSession ok: session=%s msgID=%s anchor=%s mention=%s",
+			displaySessionID(sess), shortID(id), shortID(out.ReplyToMessageID), shortID(out.MentionUserID))
+	}
+	return id, err
+}
+
+// applyStreamingAnchor decides the routing target for a session-bound
+// streamed output card/text. The contract is:
+//
+//   - Chat: follow the user's most recent location (so a thread-bound session
+//     can still reply in main chat when the user types there). Fall back to
+//     the session's pinned thread when there's no inbound history yet.
+//   - Reply anchor: prefer the user's most recent message id (gives the
+//     streamed card a quote bubble of the specific question being answered).
+//     Fall back to the thread root for backward compat and pre-inbound cases.
+//   - P2P: leave anchor empty — quote bubbles add noise in 1-on-1 chats.
+//
+// MentionUserID and IsGroup are stored on out so downstream Done-card
+// rendering (sendFinalCardForSession) can decide whether to @ the asker.
+func applyStreamingAnchor(out *channel.OutboundMessage, sess *session.Session) {
+	loc := sess.LastInbound()
+	if loc.ChatID != "" {
+		out.ChatID = loc.ChatID
+		switch {
+		case loc.IsGroup && loc.MsgID != "":
+			// Group chat: quote the user's most recent question.
+			out.ReplyToMessageID = loc.MsgID
+		case loc.ThreadID != "":
+			// In a Lark thread (group or P2P): prefer latest msg, fall
+			// back to thread root so the reply still lands in-thread.
+			if loc.MsgID != "" {
+				out.ReplyToMessageID = loc.MsgID
+			} else {
+				out.ReplyToMessageID = loc.RootMsgID
+			}
+		}
+		// P2P main chat: leave anchor empty (Create API, no quote).
+		return
+	}
+	// No inbound recorded yet — fall back to the session's pinned thread so
+	// the thread entry card still sees the new reply.
+	if anchor := sess.Info().RootMessageID; anchor != "" {
+		out.ReplyToMessageID = anchor
+	}
 }
 
 // handleOutboundError detects "thread anchor missing" failures from the Lark
@@ -704,6 +863,49 @@ func (b *Bridge) currentSession(m channel.InboundMessage) (*session.Session, boo
 		}
 	}
 	return b.mgr.FocusedSession(m.UserID)
+}
+
+// ensureCurrentSession resolves the session a command should act on, and
+// optionally reactivates it when the command needs a live CLI process.
+//
+// Resolution chain (matches the in-text "auto-resume" UX so users don't
+// need to remember the explicit /switch+/resume two-step):
+//  1. currentSession(m) — thread-bound when in a thread, focused otherwise
+//  2. mgr.ResolveResumable(userID) — pick any idle session, set focus so
+//     follow-up commands stay on the same target
+//  3. Give up with an instructive error
+//
+// When mustBeActive is true and the resolved session is idle, it gets
+// reactivated transparently. Callers that only need session metadata
+// (/rename setting custom title, /archive flipping status) pass false to
+// skip the reactivate cost.
+func (b *Bridge) ensureCurrentSession(ctx context.Context, m channel.InboundMessage, mustBeActive bool) (*session.Session, error) {
+	sess, ok := b.currentSession(m)
+	if !ok {
+		resumable := b.mgr.ResolveResumable(m.UserID)
+		if resumable == nil {
+			return nil, fmt.Errorf("当前没有 session — 用 /new 创建,或 /list 选择一个")
+		}
+		sess = resumable
+		// Only adopt main-chat focus when the user typed in main chat.
+		// In a thread, "current session" comes from thread binding —
+		// silently rewriting main-chat focus would surprise the user
+		// (their /list focus marker would change without them asking).
+		if m.ThreadID == "" {
+			_ = b.mgr.SetFocus(m.UserID, sess.ID)
+		}
+	}
+	if mustBeActive && sess.Info().Status != string(session.StatusActive) {
+		newSess, err := b.mgr.Reactivate(ctx, sess.ID)
+		if err != nil {
+			return nil, fmt.Errorf("自动恢复 session %s 失败: %w",
+				displaySessionID(sess), err)
+		}
+		b.ensureSubscribed(ctx, newSess, m)
+		b.saveStateIfPossible()
+		sess = newSess
+	}
+	return sess, nil
 }
 
 // snapshotFocus captures the active main-chat focus BEFORE a /new /resume

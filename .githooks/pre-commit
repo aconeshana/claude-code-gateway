@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Pre-commit hook: catch likely-sensitive content before it lands in git.
+#
+# Install (per clone):
+#   git config core.hooksPath .githooks
+#
+# Bypass for a single commit (rare, only when you know better):
+#   git commit --no-verify
+#
+# Maintains:
+#   - Block known secret-shaped strings (Feishu app secret, Anthropic API key,
+#     Slack/AWS/GitHub tokens, common cert/key markers)
+#   - Block files we never want tracked (.env runtime files, persistence dumps)
+#   - Block files larger than 5 MB (binary / credential bundles usually fit this)
+#
+# Anything legitimate that trips a rule can be unblocked by:
+#   1. moving it to .env / external config (preferred)
+#   2. or, if false positive, narrowing the pattern below
+
+set -euo pipefail
+
+red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow(){ printf '\033[33m%s\033[0m\n' "$*"; }
+
+# Files staged for commit (added or modified, no deletes).
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+if [[ -z "$staged" ]]; then
+  exit 0
+fi
+# Build a proper array so filenames with spaces don't word-split later.
+staged_arr=()
+while IFS= read -r f; do staged_arr+=("$f"); done <<<"$staged"
+
+fail=0
+
+# ── 1. Block path patterns ─────────────────────────────────────────────────
+# Things that should never be committed regardless of content.
+block_paths='^(\.env|\.env\..+|.+\.(pem|key|p12|pfx|jks)|.+/(id_rsa|id_ed25519|id_ecdsa|id_dsa)|.+credentials\.json|.+/secrets\.(yml|yaml|json|toml)|(^|.+/)gateway_state\.json|(^|.+/)feishu_state\.json|.+\.discovery-cache\.json)$'
+bad_paths=$(echo "$staged" | grep -E "$block_paths" || true)
+if [[ -n "$bad_paths" ]]; then
+  red "✘ pre-commit: refusing to track these path patterns:"
+  echo "$bad_paths" | sed 's/^/    /'
+  echo "  → If intentional, add an explicit exemption to .githooks/pre-commit."
+  fail=1
+fi
+
+# ── 2. Block large files (>5 MB) ───────────────────────────────────────────
+# Use git cat-file to check the staged blob size, not the working-tree file.
+for f in "${staged_arr[@]}"; do
+  size=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
+  if (( size > 5 * 1024 * 1024 )); then
+    red "✘ pre-commit: $f is $(( size / 1024 / 1024 )) MB (limit 5 MB)"
+    fail=1
+  fi
+done
+
+# ── 3. Scan staged diff for secret-shaped strings ──────────────────────────
+# Patterns that almost certainly indicate a real secret. We scan the staged
+# patch (git diff --cached) so we only see lines being added.
+patterns=(
+  # Anthropic / OpenAI API keys
+  'sk-ant-[A-Za-z0-9_-]{20,}'
+  'sk-proj-[A-Za-z0-9_-]{20,}'
+  # AWS
+  'AKIA[0-9A-Z]{16}'
+  'aws_secret_access_key\s*=\s*[A-Za-z0-9/+=]{30,}'
+  # GitHub tokens
+  'gh[oprsu]_[A-Za-z0-9]{30,}'
+  # Slack
+  'xox[abprs]-[A-Za-z0-9-]{10,}'
+  # JWT (header.payload.signature)
+  'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'
+  # Cert blocks (trailing space + ? makes the type optional, no empty alt)
+  '-----BEGIN ((RSA|EC|DSA|OPENSSH|PGP) )?PRIVATE KEY-----'
+  # Feishu/Lark app secret (specific assignment with non-placeholder value)
+  '(FEISHU|LARK)_APP_SECRET\s*[:=]\s*[A-Za-z0-9]{16,}'
+  # Generic "secret = <32+ chars>" assignment (catches custom configs)
+  '(password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[:=]\s*['"'"'"]?[A-Za-z0-9_/+=-]{24,}'
+)
+
+diff_content=$(git diff --cached -U0 -- "${staged_arr[@]}")
+# Strip diff metadata lines so we only scan added lines (start with +, not +++).
+added_lines=$(echo "$diff_content" | grep -E '^\+[^+]' || true)
+
+for pat in "${patterns[@]}"; do
+  hits=$(echo "$added_lines" | grep -E -i -e "$pat" || true)
+  if [[ -n "$hits" ]]; then
+    red "✘ pre-commit: looks like a secret matching: $pat"
+    echo "$hits" | head -3 | sed 's/^/    /'
+    fail=1
+  fi
+done
+
+# ── 4. Bare hex/alnum tokens in config-like files ──────────────────────────
+# Catches UUID-without-dash style and 32-char hex app secrets sitting in
+# config files without a "secret=" keyword. Restricted to file types where
+# hash literals are rare (config formats), so commit hashes / docker IDs /
+# test fixtures in code don't trigger.
+#
+# Triggers when an added line in a config file contains a 32-64 char token
+# made of lowercase letters + digits (typical Feishu/Lark/many SaaS secret
+# shapes). Quoted or bare both match.
+config_files=$(echo "$staged" | grep -E '\.(env|env\..+|toml|ya?ml|ini|conf|cfg)$|(^|/)config\.json$' | grep -vE '_test\.|/test/|/testdata/|/fixtures/|/vendor/' || true)
+if [[ -n "$config_files" ]]; then
+  config_arr=()
+  while IFS= read -r f; do config_arr+=("$f"); done <<<"$config_files"
+  bare_hex_pat='(^|[^A-Za-z0-9])[a-z0-9]{32,64}([^A-Za-z0-9]|$)'
+  bare_hits=$(git diff --cached -U0 -- "${config_arr[@]}" | grep -E '^\+[^+]' | grep -E -e "$bare_hex_pat" || true)
+  # Filter out lines that look like example/placeholder values ("xxx", "your_xxx", "example", etc.)
+  bare_hits=$(echo "$bare_hits" | grep -vE 'xxx{2,}|your_|example|placeholder|<.+>|REPLACE_ME|TODO|FIXME' || true)
+  if [[ -n "$bare_hits" ]]; then
+    red "✘ pre-commit: config file contains a long lowercase-alnum token (looks like a secret):"
+    echo "$bare_hits" | head -3 | sed 's/^/    /'
+    echo "  → If this is a real secret, move it to .env (not tracked) and reference via env var."
+    echo "  → If it's a placeholder, use 'xxx' / 'your_secret' / '<APP_SECRET>' so the hook recognises it."
+    fail=1
+  fi
+fi
+
+if (( fail )); then
+  echo ""
+  yellow "Bypass with 'git commit --no-verify' only if you are 100% sure (and rotate the secret if you push)."
+  exit 1
+fi
+
+green "✓ pre-commit: no secrets detected"
+exit 0
