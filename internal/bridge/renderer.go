@@ -224,6 +224,9 @@ func (s *streamState) renderHeartbeat(ctx context.Context, b *Bridge, chatID str
 	}
 	msgID := s.messageID
 	content := truncate(s.textBuf.String())
+	if content == "" {
+		content = "_(thinking · running tool…)_"
+	}
 	card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.turnStart, s.lastEvent)
 	s.mu.Unlock()
 	_ = b.updateCard(ctx, msgID, card)

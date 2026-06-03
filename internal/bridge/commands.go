@@ -586,6 +586,8 @@ func (b *Bridge) switchFocusTo(ctx context.Context, m channel.InboundMessage, se
 							ChatID:    info.ChatID,
 							ThreadID:  info.ThreadID,
 							RootMsgID: info.RootMessageID,
+							UserID:    m.UserID,
+							IsGroup:   m.IsGroup,
 						})
 					}
 				}
@@ -600,6 +602,8 @@ func (b *Bridge) switchFocusTo(ctx context.Context, m channel.InboundMessage, se
 				ChatID:    pInfo.ChatID,
 				ThreadID:  pInfo.ThreadID,
 				RootMsgID: pInfo.RootMessageID,
+				UserID:    m.UserID,
+				IsGroup:   m.IsGroup,
 			})
 			pingText := fmt.Sprintf("📌 主聊天 focus 已切走,在这里继续 [`%s`] · %s", displaySessionID(priorFocus), priorFocus.Label)
 			_, _ = b.ch.SendMessage(ctx, channel.OutboundMessage{

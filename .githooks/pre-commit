@@ -28,12 +28,15 @@ staged=$(git diff --cached --name-only --diff-filter=ACM)
 if [[ -z "$staged" ]]; then
   exit 0
 fi
+# Build a proper array so filenames with spaces don't word-split later.
+staged_arr=()
+while IFS= read -r f; do staged_arr+=("$f"); done <<<"$staged"
 
 fail=0
 
 # ── 1. Block path patterns ─────────────────────────────────────────────────
 # Things that should never be committed regardless of content.
-block_paths='^(\.env|\.env\..+|.+\.pem|.+\.p12|.+/id_rsa|.+/id_ed25519|.+credentials\.json|.+/secrets\.(yml|yaml|json|toml)|gateway_state\.json|feishu_state\.json|.+\.discovery-cache\.json)$'
+block_paths='^(\.env|\.env\..+|.+\.(pem|key|p12|pfx|jks)|.+/(id_rsa|id_ed25519|id_ecdsa|id_dsa)|.+credentials\.json|.+/secrets\.(yml|yaml|json|toml)|gateway_state\.json|feishu_state\.json|.+\.discovery-cache\.json)$'
 bad_paths=$(echo "$staged" | grep -E "$block_paths" || true)
 if [[ -n "$bad_paths" ]]; then
   red "✘ pre-commit: refusing to track these path patterns:"
@@ -43,14 +46,14 @@ if [[ -n "$bad_paths" ]]; then
 fi
 
 # ── 2. Block large files (>5 MB) ───────────────────────────────────────────
-while IFS= read -r f; do
-  [[ -f "$f" ]] || continue
-  size=$(wc -c <"$f" | tr -d ' ')
+# Use git cat-file to check the staged blob size, not the working-tree file.
+for f in "${staged_arr[@]}"; do
+  size=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
   if (( size > 5 * 1024 * 1024 )); then
     red "✘ pre-commit: $f is $(( size / 1024 / 1024 )) MB (limit 5 MB)"
     fail=1
   fi
-done <<<"$staged"
+done
 
 # ── 3. Scan staged diff for secret-shaped strings ──────────────────────────
 # Patterns that almost certainly indicate a real secret. We scan the staged
@@ -76,7 +79,7 @@ patterns=(
   '(password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token)\s*[:=]\s*['"'"'"]?[A-Za-z0-9_/+=-]{24,}'
 )
 
-diff_content=$(git diff --cached -U0 -- $(echo "$staged" | tr '\n' ' '))
+diff_content=$(git diff --cached -U0 -- "${staged_arr[@]}")
 # Strip diff metadata lines so we only scan added lines (start with +, not +++).
 added_lines=$(echo "$diff_content" | grep -E '^\+[^+]' || true)
 
@@ -100,8 +103,10 @@ done
 # shapes). Quoted or bare both match.
 config_files=$(echo "$staged" | grep -E '\.(env|env\..+|toml|ya?ml|ini|conf|cfg)$|(^|/)config\.json$' | grep -vE '_test\.|/test/|/testdata/|/fixtures/|/vendor/' || true)
 if [[ -n "$config_files" ]]; then
+  config_arr=()
+  while IFS= read -r f; do config_arr+=("$f"); done <<<"$config_files"
   bare_hex_pat='(^|[^A-Za-z0-9])[a-z0-9]{32,64}([^A-Za-z0-9]|$)'
-  bare_hits=$(git diff --cached -U0 -- $(echo "$config_files" | tr '\n' ' ') | grep -E '^\+[^+]' | grep -E -e "$bare_hex_pat" || true)
+  bare_hits=$(git diff --cached -U0 -- "${config_arr[@]}" | grep -E '^\+[^+]' | grep -E -e "$bare_hex_pat" || true)
   # Filter out lines that look like example/placeholder values ("xxx", "your_xxx", "example", etc.)
   bare_hits=$(echo "$bare_hits" | grep -vE 'xxx{2,}|your_|example|placeholder|<.+>|REPLACE_ME|TODO|FIXME' || true)
   if [[ -n "$bare_hits" ]]; then
