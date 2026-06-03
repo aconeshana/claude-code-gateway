@@ -84,9 +84,10 @@ func newTestChannel(botOpenID string) *Channel {
 	return c
 }
 
-func TestGroupThread_NoMention_Dropped(t *testing.T) {
-	// Group threads support multiple participants, so they follow the same
-	// @mention rule as the main group chat (rule 2). P2P threads are unaffected.
+func TestGroupThread_NoMention_PassedTobridge(t *testing.T) {
+	// Group thread messages without @mention are passed through by the channel
+	// layer (MentionedBot=false). The bridge decides whether to act based on
+	// session ownership — that logic lives in bridge, not channel.
 	c := newTestChannel("ou_bot")
 	h := &captureHandler{}
 	c.mu.Lock()
@@ -97,8 +98,15 @@ func TestGroupThread_NoMention_Dropped(t *testing.T) {
 	if err := c.onMessageReceive(context.Background(), ev); err != nil {
 		t.Fatalf("onMessageReceive: %v", err)
 	}
-	if h.count() != 0 {
-		t.Fatalf("expected 0 dispatches (group thread without @mention must be dropped), got %d", h.count())
+	if h.count() != 1 {
+		t.Fatalf("expected 1 dispatch (channel passes through, bridge filters), got %d", h.count())
+	}
+	msg, _ := h.last()
+	if msg.MentionedBot {
+		t.Error("MentionedBot should be false when no @mention")
+	}
+	if msg.ThreadID != "omt_thread1" {
+		t.Errorf("ThreadID = %q, want omt_thread1", msg.ThreadID)
 	}
 }
 
@@ -178,6 +186,9 @@ func TestGroupThread_WithMention_MentionStripped(t *testing.T) {
 	msg, _ := h.last()
 	if msg.Text == "" {
 		t.Error("text should not be empty after stripping @mention")
+	}
+	if !msg.MentionedBot {
+		t.Error("MentionedBot should be true when @mention present in thread")
 	}
 }
 

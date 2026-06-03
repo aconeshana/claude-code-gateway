@@ -601,8 +601,17 @@ func (c *Channel) onMessageReceive(ctx context.Context, event *larkim.P2MessageR
 			return nil
 		}
 		if chatType == "group" {
-			if !c.isMentionedInGroup(msg.Mentions) {
-				return nil
+			mentioned := c.isMentionedInGroup(msg.Mentions)
+			if inbound.ThreadID != "" {
+				// Group thread: pass through regardless of @mention.
+				// Bridge decides whether to act based on session ownership
+				// (owner's thread = effectively P2P; non-owner requires @mention).
+				inbound.MentionedBot = mentioned
+			} else {
+				// Main group chat: require @mention before routing.
+				if !mentioned {
+					return nil
+				}
 			}
 			text = strings.TrimSpace(stripMentions(text))
 			if text == "" {
@@ -636,8 +645,13 @@ func (c *Channel) onMessageReceive(ctx context.Context, event *larkim.P2MessageR
 		// Mention tags are flattened to their plain text (or dropped if
 		// they target the bot itself, mirroring the text branch).
 		text, imageKeys := parsePostContent(*msg.Content)
-		if chatType == "group" && !c.isMentionedInGroup(msg.Mentions) {
-			return nil
+		if chatType == "group" {
+			mentioned := c.isMentionedInGroup(msg.Mentions)
+			if inbound.ThreadID != "" {
+				inbound.MentionedBot = mentioned
+			} else if !mentioned {
+				return nil
+			}
 		}
 		var blocks []interface{}
 		for _, key := range imageKeys {

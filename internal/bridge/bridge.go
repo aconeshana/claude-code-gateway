@@ -330,6 +330,12 @@ func (b *Bridge) resolveOrCreateSession(ctx context.Context, m channel.InboundMe
 
 		if sess, ok := b.mgr.GetByThreadID(m.ThreadID); ok {
 			if live, alive := b.mgr.Get(sess.ID); alive {
+				// Group thread: only the session owner can address the bot
+				// without @mention; anyone else must explicitly @mention it.
+				if m.IsGroup && live.Info().OwnerID != m.UserID && !m.MentionedBot {
+					log.Printf("[bridge] thread message from non-owner %s without @mention — ignored", shortID(m.UserID))
+					return nil, false
+				}
 				if live.Info().Status == string(session.StatusActive) {
 					return live, true
 				}
@@ -349,6 +355,13 @@ func (b *Bridge) resolveOrCreateSession(ctx context.Context, m channel.InboundMe
 		// (if that session isn't already pinned to another thread); otherwise
 		// create a fresh session for this thread so each thread stays a
 		// physically separate context.
+		//
+		// Group chats: require @mention to create/bind a new thread (same rule
+		// as main chat). Owner messages bypass this after the first binding.
+		if m.IsGroup && !m.MentionedBot {
+			log.Printf("[bridge] group thread from %s without @mention and no known binding — ignored", shortID(m.UserID))
+			return nil, false
+		}
 		var target *session.Session
 		if focused, ok := b.mgr.FocusedSession(m.UserID); ok && focused.Info().ThreadID == "" {
 			target = focused
