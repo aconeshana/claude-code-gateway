@@ -129,6 +129,15 @@ type InboundMessage struct {
 	RootID   string
 	ParentID string
 
+	// MentionedBot is true when the sending user explicitly @-mentioned the
+	// bot in this message. Only meaningful when IsGroup is true; always false
+	// for P2P messages (no @-mention convention there).
+	//
+	// Bridges use this to allow non-owners to address the bot inside a group
+	// thread without being the session owner: owner messages are always
+	// accepted; non-owner messages require MentionedBot=true.
+	MentionedBot bool
+
 	// Reply, when set by the channel, lets the handler synchronously supply a
 	// card to send back in the same response cycle. Only meaningful for
 	// platforms that expect a synchronous response to an inbound event

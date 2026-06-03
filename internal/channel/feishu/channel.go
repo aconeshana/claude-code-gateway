@@ -600,20 +600,19 @@ func (c *Channel) onMessageReceive(ctx context.Context, event *larkim.P2MessageR
 		if text == "" {
 			return nil
 		}
-		if chatType == "group" && inbound.ThreadID == "" {
-			// Thread messages bypass the @mention requirement: the user is
-			// already inside a bot-session thread, so every message in that
-			// thread is implicitly directed at the bot.
-			if !c.isMentionedInGroup(msg.Mentions) {
-				return nil
+		if chatType == "group" {
+			mentioned := c.isMentionedInGroup(msg.Mentions)
+			if inbound.ThreadID != "" {
+				// Group thread: pass through regardless of @mention.
+				// Bridge decides whether to act based on session ownership
+				// (owner's thread = effectively P2P; non-owner requires @mention).
+				inbound.MentionedBot = mentioned
+			} else {
+				// Main group chat: require @mention before routing.
+				if !mentioned {
+					return nil
+				}
 			}
-			text = strings.TrimSpace(stripMentions(text))
-			if text == "" {
-				return nil
-			}
-		} else if chatType == "group" && inbound.ThreadID != "" {
-			// Strip @bot mentions even in thread messages so the bot doesn't
-			// see its own mention tag as part of the user's input.
 			text = strings.TrimSpace(stripMentions(text))
 			if text == "" {
 				return nil
@@ -646,8 +645,13 @@ func (c *Channel) onMessageReceive(ctx context.Context, event *larkim.P2MessageR
 		// Mention tags are flattened to their plain text (or dropped if
 		// they target the bot itself, mirroring the text branch).
 		text, imageKeys := parsePostContent(*msg.Content)
-		if chatType == "group" && inbound.ThreadID == "" && !c.isMentionedInGroup(msg.Mentions) {
-			return nil
+		if chatType == "group" {
+			mentioned := c.isMentionedInGroup(msg.Mentions)
+			if inbound.ThreadID != "" {
+				inbound.MentionedBot = mentioned
+			} else if !mentioned {
+				return nil
+			}
 		}
 		var blocks []interface{}
 		for _, key := range imageKeys {
