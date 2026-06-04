@@ -1170,6 +1170,10 @@ func (b *Bridge) handleCardAction(ctx context.Context, m channel.InboundMessage)
 		// Back-button payloads on cards rendered before the /list and /project
 		// merge still use "back_to_list" — route to the merged projects card.
 		b.replyWithProjectsCard(ctx, m)
+	case "diff_file_list":
+		b.handleDiffFileList(ctx, m)
+	case "diff_file_detail":
+		b.handleDiffFileDetail(ctx, m)
 	case "resume_session":
 		id, _ := m.Action.Values["session_id"].(string)
 		if id == "" {

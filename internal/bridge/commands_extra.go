@@ -141,6 +141,7 @@ const (
 	maxDiffLinesPerFile = 50
 	maxDiffTotalLen     = 12000
 	diffTimeout         = 10 * time.Second
+	diffFilesPerPage    = 8
 )
 
 type fileDiff struct {
@@ -189,39 +190,205 @@ func (b *Bridge) cmdDiff(ctx context.Context, m channel.InboundMessage) {
 		return
 	}
 
-	title := fmt.Sprintf("Diff: %d files", len(fileDiffs))
+	b.replyCard(ctx, m, buildDiffListCard(wd, stat, fileDiffs, 0))
+}
+
+// buildDiffListCard renders a paginated file-list card for /diff.
+// Each file is one button row; clicking drills into the single-file diff view.
+func buildDiffListCard(wd, stat string, fileDiffs []fileDiff, page int) channel.Card {
+	total := len(fileDiffs)
+	maxPage := (total - 1) / diffFilesPerPage
+	if page < 0 {
+		page = 0
+	}
+	if page > maxPage {
+		page = maxPage
+	}
+	start := page * diffFilesPerPage
+	end := start + diffFilesPerPage
+	if end > total {
+		end = total
+	}
+
+	title := fmt.Sprintf("Diff: %d files", total)
 	if stat != "" {
 		title = "Diff: " + stat
 	}
 
 	var sections []channel.Section
-	for i, f := range fileDiffs {
-		header := "**" + shortenFilePath(f.Name) + "**"
+
+	if total > diffFilesPerPage {
+		sections = append(sections, channel.Section{
+			Markdown: fmt.Sprintf("**文件** %d–%d / %d", start+1, end, total),
+		})
+	}
+
+	for _, f := range fileDiffs[start:end] {
+		label := "📄 " + shortenFilePath(f.Name)
 		if f.Added > 0 || f.Deleted > 0 {
-			header += " · "
+			label += " "
 			if f.Deleted > 0 {
-				header += fmt.Sprintf("<font color='red'>-%d</font> ", f.Deleted)
+				label += fmt.Sprintf("-%d", f.Deleted)
 			}
 			if f.Added > 0 {
-				header += fmt.Sprintf("<font color='green'>+%d</font>", f.Added)
+				label += fmt.Sprintf("+%d", f.Added)
 			}
+		} else if len(f.Lines) > 0 && f.Lines[0].Content == "(new untracked file)" {
+			label += " [new]"
 		}
-		sec := channel.Section{Markdown: header}
-		if len(f.Lines) > 0 {
-			sec.Markdown += "\n" + renderDiffLines(f.Lines)
+		sections = append(sections, channel.Section{
+			Buttons: []channel.Button{{
+				Label: label,
+				Style: "default",
+				Action: map[string]string{
+					"action":      "diff_file_detail",
+					"working_dir": wd,
+					"file":        f.Name,
+					"list_page":   strconv.Itoa(page),
+				},
+			}},
+		})
+	}
+
+	if total > diffFilesPerPage {
+		var navBtns []channel.Button
+		if page > 0 {
+			navBtns = append(navBtns, channel.Button{
+				Label: "◀ 上一页", Style: "default",
+				Action: map[string]string{
+					"action":      "diff_file_list",
+					"working_dir": wd,
+					"page":        strconv.Itoa(page - 1),
+				},
+			})
 		}
-		sections = append(sections, sec)
-		if i < len(fileDiffs)-1 {
-			sections = append(sections, channel.Section{Divider: true})
+		if end < total {
+			navBtns = append(navBtns, channel.Button{
+				Label: "下一页 ▶", Style: "default",
+				Action: map[string]string{
+					"action":      "diff_file_list",
+					"working_dir": wd,
+					"page":        strconv.Itoa(page + 1),
+				},
+			})
+		}
+		if len(navBtns) > 0 {
+			sections = append(sections, channel.Section{Buttons: navBtns})
 		}
 	}
 
-	b.replyCard(ctx, m, channel.Card{
+	return channel.Card{
 		Title:    title,
 		Tone:     channel.ToneSuccess,
 		Sections: sections,
-	})
+	}
 }
+
+// handleDiffFileList re-runs git diff and re-renders the paginated file list.
+// Called by the prev/next navigation buttons in buildDiffListCard.
+func (b *Bridge) handleDiffFileList(ctx context.Context, m channel.InboundMessage) {
+	if m.Action == nil {
+		return
+	}
+	wd, _ := m.Action.Values["working_dir"].(string)
+	pageStr, _ := m.Action.Values["page"].(string)
+	page, _ := strconv.Atoi(pageStr)
+	if wd == "" {
+		return
+	}
+
+	diffCtx, cancel := context.WithTimeout(ctx, diffTimeout)
+	defer cancel()
+
+	stat := strings.TrimSpace(runGit(diffCtx, wd, "diff", "HEAD", "--shortstat"))
+	rawDiff := runGit(diffCtx, wd, "diff", "HEAD")
+	untracked := runGit(diffCtx, wd, "ls-files", "--others", "--exclude-standard")
+
+	fileDiffs := parseDiffByFile(rawDiff)
+	if untracked != "" {
+		for _, f := range strings.Split(strings.TrimSpace(untracked), "\n") {
+			f = strings.TrimSpace(f)
+			if f != "" {
+				fileDiffs = append(fileDiffs, fileDiff{Name: f, Lines: []diffLine{{Type: '+', Content: "(new untracked file)"}}})
+			}
+		}
+	}
+
+	card := buildDiffListCard(wd, stat, fileDiffs, page)
+	if m.Reply != nil {
+		m.Reply(card)
+	} else {
+		b.replyCard(ctx, m, card)
+	}
+}
+
+// handleDiffFileDetail fetches the diff for one file and renders it.
+// Called when the user clicks a file button in buildDiffListCard.
+func (b *Bridge) handleDiffFileDetail(ctx context.Context, m channel.InboundMessage) {
+	if m.Action == nil {
+		return
+	}
+	wd, _ := m.Action.Values["working_dir"].(string)
+	file, _ := m.Action.Values["file"].(string)
+	listPage, _ := strconv.Atoi(m.Action.Values["list_page"].(string))
+	if wd == "" || file == "" {
+		return
+	}
+
+	diffCtx, cancel := context.WithTimeout(ctx, diffTimeout)
+	defer cancel()
+
+	rawDiff := runGit(diffCtx, wd, "diff", "HEAD", "--", file)
+	// Also check if it's an untracked file.
+	isUntracked := false
+	if strings.TrimSpace(rawDiff) == "" {
+		untracked := runGit(diffCtx, wd, "ls-files", "--others", "--exclude-standard", "--", file)
+		if strings.TrimSpace(untracked) != "" {
+			isUntracked = true
+		}
+	}
+
+	var sections []channel.Section
+	if isUntracked {
+		sections = append(sections, channel.Section{Markdown: "_(new untracked file — no diff available)_"})
+	} else {
+		parsed := parseDiffByFile(rawDiff)
+		if len(parsed) > 0 {
+			rendered := renderDiffLines(parsed[0].Lines)
+			if rendered != "" {
+				sections = append(sections, channel.Section{Markdown: rendered})
+			}
+		}
+		if len(sections) == 0 {
+			sections = append(sections, channel.Section{Markdown: "_(no diff)_"})
+		}
+	}
+
+	// Back button returns to the file list at the same page.
+	sections = append(sections, channel.Section{
+		Divider: true,
+		Buttons: []channel.Button{{
+			Label: "← 文件列表", Style: "default",
+			Action: map[string]string{
+				"action":      "diff_file_list",
+				"working_dir": wd,
+				"page":        strconv.Itoa(listPage),
+			},
+		}},
+	})
+
+	card := channel.Card{
+		Title:    "Diff: " + shortenFilePath(file),
+		Tone:     channel.ToneSuccess,
+		Sections: sections,
+	}
+	if m.Reply != nil {
+		m.Reply(card)
+	} else {
+		b.replyCard(ctx, m, card)
+	}
+}
+
 
 func runGit(ctx context.Context, dir string, args ...string) string {
 	cmd := exec.CommandContext(ctx, "git", args...)
