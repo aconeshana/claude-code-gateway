@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1170,6 +1171,8 @@ func (b *Bridge) handleCardAction(ctx context.Context, m channel.InboundMessage)
 		// Back-button payloads on cards rendered before the /list and /project
 		// merge still use "back_to_list" — route to the merged projects card.
 		b.replyWithProjectsCard(ctx, m)
+	case "todo_page":
+		b.handleTodoPage(ctx, m)
 	case "resume_session":
 		id, _ := m.Action.Values["session_id"].(string)
 		if id == "" {
@@ -1876,6 +1879,64 @@ func valueOrDash(s string) string {
 		return "—"
 	}
 	return s
+}
+
+// handleTodoPage handles the "todo_page" card action — updates the displayed
+// page of the todo list inside a Processing or Done card.
+//
+// For live sessions the page is written into the active streamState and takes
+// effect on the next heartbeat or stream event (the stream goroutine owns the
+// card update loop, so we must not race it here).
+//
+// For Done cards the session's last-known todos are fetched from the bridge
+// store and a standalone "任务列表" card is sent back via m.Reply so the user
+// can browse todos after the session has finished.
+func (b *Bridge) handleTodoPage(ctx context.Context, m channel.InboundMessage) {
+	if m.Action == nil {
+		return
+	}
+	sessID, _ := m.Action.Values["session_id"].(string)
+	pageStr, _ := m.Action.Values["page"].(string)
+	page, _ := strconv.Atoi(pageStr)
+	if page < 0 {
+		page = 0
+	}
+
+	// Live stream: update page; stream goroutine picks it up on next render.
+	if state := b.getActiveStream(sessID); state != nil {
+		state.mu.Lock()
+		state.todosPage = page
+		state.mu.Unlock()
+		return
+	}
+
+	// Done / idle session: re-render a standalone todo card via Reply.
+	todos := b.getSessionTodos(sessID)
+	if len(todos) == 0 {
+		return
+	}
+	project := ""
+	if sess, ok := b.resolveSessionByPayload(sessID); ok {
+		project = projectName(sess.WorkingDir)
+	}
+	title := "任务列表"
+	if project != "" {
+		title += ": " + project
+	}
+	sections := renderTodosSections(todos, page, sessID)
+	if len(sections) == 0 {
+		return
+	}
+	card := channel.Card{
+		Title:    title,
+		Tone:     channel.ToneInfo,
+		Sections: sections,
+	}
+	if m.Reply != nil {
+		m.Reply(card)
+	} else {
+		b.replyCard(ctx, m, card)
+	}
 }
 
 var _ = json.Marshal

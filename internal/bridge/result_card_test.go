@@ -23,7 +23,7 @@ func TestResultCard_InterruptedRendersAsStopped(t *testing.T) {
 		TotalCostUSD: 0.01,
 	}
 
-	card := b.resultCardWithIDAndInterrupt("proj", "abc12345", "", "sonnet", "", 0, "partial output", result, true)
+	card := b.resultCardWithIDAndInterrupt("proj", "abc12345", "", "sonnet", "", 0, "partial output", nil, 0, "", result, true)
 
 	if !strings.HasPrefix(card.Title, "Stopped") {
 		t.Errorf("title = %q, want it to start with 'Stopped' (interrupted=true)", card.Title)
@@ -43,7 +43,7 @@ func TestResultCard_InterruptedRendersAsStopped(t *testing.T) {
 func TestResultCard_RealErrorStillRendersAsError(t *testing.T) {
 	b, _, _ := newTestBridge(t)
 	result := &protocol.ResultMessage{IsError: true}
-	card := b.resultCardWithIDAndInterrupt("proj", "abc", "", "sonnet", "", 0, "", result, false)
+	card := b.resultCardWithIDAndInterrupt("proj", "abc", "", "sonnet", "", 0, "", nil, 0, "", result, false)
 
 	if !strings.HasPrefix(card.Title, "Error") {
 		t.Errorf("title = %q, want 'Error' for genuine failure", card.Title)
@@ -59,7 +59,7 @@ func TestResultCard_RealErrorStillRendersAsError(t *testing.T) {
 func TestResultCard_SuccessUnaffected(t *testing.T) {
 	b, _, _ := newTestBridge(t)
 	result := &protocol.ResultMessage{IsError: false}
-	card := b.resultCardWithIDAndInterrupt("proj", "abc", "", "sonnet", "", 0, "all good", result, false)
+	card := b.resultCardWithIDAndInterrupt("proj", "abc", "", "sonnet", "", 0, "all good", nil, 0, "", result, false)
 
 	if !strings.HasPrefix(card.Title, "Done") {
 		t.Errorf("title = %q, want 'Done' for success", card.Title)

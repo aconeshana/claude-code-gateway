@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,8 @@ func (b *Bridge) streamSession(ctx context.Context, sess *session.Session, chatI
 		gitBranch:    getGitBranch(sess.WorkingDir),
 		contextPct:   0,
 	}
+	b.registerStream(sess.ID, state)
+	defer b.unregisterStream(sess.ID)
 
 	for {
 		select {
@@ -183,7 +186,8 @@ type streamState struct {
 
 	// Session-level todo list; updated on every TodoWrite call and persists
 	// across turns so the Done card always shows the latest state.
-	todos []todoItem
+	todos     []todoItem
+	todosPage int // current display page (0-indexed, 8 items/page)
 }
 
 // startHeartbeat ensures a background goroutine is re-rendering the
@@ -243,7 +247,7 @@ func (s *streamState) renderHeartbeat(ctx context.Context, b *Bridge, chatID str
 	if content == "" {
 		content = "_(thinking · running tool…)_"
 	}
-	card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.todos, s.turnStart, s.lastEvent)
+	card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.todos, s.todosPage, s.sess, s.turnStart, s.lastEvent)
 	s.mu.Unlock()
 	_ = b.updateCard(ctx, msgID, card)
 }
@@ -283,7 +287,7 @@ func (s *streamState) ensureProgressCard(ctx context.Context, b *Bridge, chatID 
 	// Empty body — the HUD note carries everything user-visible
 	// (current tool, elapsed). The body fills in once assistant text
 	// arrives.
-	card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, "_(thinking · running tool…)_", s.currentTool, s.todos, s.turnStart, s.lastEvent)
+	card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, "_(thinking · running tool…)_", s.currentTool, s.todos, s.todosPage, s.sess, s.turnStart, s.lastEvent)
 	s.mu.Unlock()
 
 	msgID, err := b.sendCardForSession(ctx, s.sess, chatID, card)
@@ -328,7 +332,7 @@ func (s *streamState) appendText(ctx context.Context, b *Bridge, chatID, text st
 
 	if s.messageID == "" {
 		content := truncate(s.textBuf.String())
-		card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.todos, s.turnStart, s.lastEvent)
+		card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.todos, s.todosPage, s.sess, s.turnStart, s.lastEvent)
 		msgID, err := b.sendCardForSession(ctx, s.sess, chatID, card)
 		if err != nil {
 			return
@@ -360,7 +364,7 @@ func (s *streamState) appendText(ctx context.Context, b *Bridge, chatID, text st
 		}
 		s.timer = nil
 		content := truncate(s.textBuf.String())
-		card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.todos, s.turnStart, s.lastEvent)
+		card := b.processingCardWithProgress(s.project, s.sessionShort, s.summary, s.model, s.gitBranch, s.contextPct, content, s.currentTool, s.todos, s.todosPage, s.sess, s.turnStart, s.lastEvent)
 		_ = b.updateCard(ctx, s.messageID, card)
 		s.lastUpdate = time.Now()
 		s.dirty = false
@@ -384,7 +388,16 @@ func (s *streamState) finalize(ctx context.Context, b *Bridge, chatID string, re
 	gitBranch := s.gitBranch
 	contextPct := s.contextPct
 	todos := s.todos
+	todosPage := s.todosPage
+	sessID := ""
+	if s.sess != nil {
+		sessID = s.sess.ID
+	}
 	s.mu.Unlock()
+
+	if sessID != "" && len(todos) > 0 {
+		b.storeSessionTodos(sessID, todos)
+	}
 
 	if result.IsError && msgID == "" && buffered == "" {
 		// no user-visible output; suppress
@@ -409,7 +422,7 @@ func (s *streamState) finalize(ctx context.Context, b *Bridge, chatID string, re
 	// scary red "Error".
 	interrupted := s.sess != nil && s.sess.ConsumeInterruptedFlag()
 
-	card := b.resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch, contextPct, content, todos, result, interrupted)
+	card := b.resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch, contextPct, content, todos, todosPage, sessID, result, interrupted)
 	if msgID != "" {
 		if err := b.updateFinalCardForSession(ctx, msgID, s.sess, card); err != nil {
 			_, _ = b.sendFinalCardForSession(ctx, s.sess, chatID, card)
@@ -456,7 +469,7 @@ func (b *Bridge) processingCard(project, summary, model, gitBranch string, conte
 // suffix lets users running multiple parallel sessions identify which card
 // belongs to which session at a glance, and copy the id for /switch.
 func (b *Bridge) processingCardWithID(project, sessionShort, summary, model, gitBranch string, contextPct int, content string) channel.Card {
-	return b.processingCardWithProgress(project, sessionShort, summary, model, gitBranch, contextPct, content, "", nil, time.Time{}, time.Time{})
+	return b.processingCardWithProgress(project, sessionShort, summary, model, gitBranch, contextPct, content, "", nil, 0, nil, time.Time{}, time.Time{})
 }
 
 // processingCardWithProgress is the full-fat variant used by streamSession
@@ -464,7 +477,7 @@ func (b *Bridge) processingCardWithID(project, sessionShort, summary, model, git
 // (current tool, turn-start, last-event) woven into the HUD note so a
 // user staring at the card for 17 minutes can tell whether the agent is
 // still working or stuck.
-func (b *Bridge) processingCardWithProgress(project, sessionShort, summary, model, gitBranch string, contextPct int, content, currentTool string, todos []todoItem, turnStart, lastEvent time.Time) channel.Card {
+func (b *Bridge) processingCardWithProgress(project, sessionShort, summary, model, gitBranch string, contextPct int, content, currentTool string, todos []todoItem, todosPage int, sess *session.Session, turnStart, lastEvent time.Time) channel.Card {
 	title := "Processing"
 	if project != "" {
 		title += ": " + project
@@ -477,10 +490,12 @@ func (b *Bridge) processingCardWithProgress(project, sessionShort, summary, mode
 	if summary != "" {
 		note = summary + " | " + hud
 	}
-	sections := []channel.Section{{Markdown: content}}
-	if md := renderTodosMarkdown(todos); md != "" {
-		sections = append(sections, channel.Section{Markdown: md})
+	sessID := ""
+	if sess != nil {
+		sessID = sess.ID
 	}
+	sections := []channel.Section{{Markdown: content}}
+	sections = append(sections, renderTodosSections(todos, todosPage, sessID)...)
 	sections = append(sections, channel.Section{Note: note})
 	return channel.Card{
 		Title:    title,
@@ -494,13 +509,13 @@ func (b *Bridge) resultCard(project, summary, model, gitBranch string, contextPc
 }
 
 func (b *Bridge) resultCardWithID(project, sessionShort, summary, model, gitBranch string, contextPct int, content string, result *protocol.ResultMessage) channel.Card {
-	return b.resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch, contextPct, content, nil, result, false)
+	return b.resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch, contextPct, content, nil, 0, "", result, false)
 }
 
 // resultCardWithIDAndInterrupt is the parameterized form used by streamSession.
 // interrupted=true means /stop fired before the CLI exited; render as a neutral
 // "Stopped" card instead of a red "Error" card so the UX matches user intent.
-func (b *Bridge) resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch string, contextPct int, content string, todos []todoItem, result *protocol.ResultMessage, interrupted bool) channel.Card {
+func (b *Bridge) resultCardWithIDAndInterrupt(project, sessionShort, summary, model, gitBranch string, contextPct int, content string, todos []todoItem, todosPage int, sessID string, result *protocol.ResultMessage, interrupted bool) channel.Card {
 	title := "Done"
 	tone := channel.ToneSuccess
 	switch {
@@ -526,9 +541,7 @@ func (b *Bridge) resultCardWithIDAndInterrupt(project, sessionShort, summary, mo
 		note = summary + " | " + hud
 	}
 	sections := []channel.Section{{Markdown: content}}
-	if md := renderTodosMarkdown(todos); md != "" {
-		sections = append(sections, channel.Section{Markdown: md})
-	}
+	sections = append(sections, renderTodosSections(todos, todosPage, sessID)...)
 	sections = append(sections, channel.Section{Divider: true, Note: note})
 	return channel.Card{
 		Title:    title,
@@ -689,24 +702,87 @@ func extractTodoItems(raw json.RawMessage) []todoItem {
 	return nil
 }
 
-// renderTodosMarkdown converts a todo list to a Markdown string using emoji
-// status indicators. Returns "" when the slice is empty.
-func renderTodosMarkdown(todos []todoItem) string {
+const todosPerPage = 8
+
+// renderTodosSections converts a todo list to card sections using one button
+// per item (matching the /project directory-picker style). When todos exceed
+// todosPerPage, prev/next navigation buttons are appended. sessID is embedded
+// in the pagination button actions so todo_page card-action can find the
+// correct session without a separate lookup.
+func renderTodosSections(todos []todoItem, page int, sessID string) []channel.Section {
 	if len(todos) == 0 {
-		return ""
+		return nil
 	}
-	var sb strings.Builder
-	for _, t := range todos {
+	// Clamp page to valid range.
+	total := len(todos)
+	maxPage := (total - 1) / todosPerPage
+	if page < 0 {
+		page = 0
+	}
+	if page > maxPage {
+		page = maxPage
+	}
+	start := page * todosPerPage
+	end := start + todosPerPage
+	if end > total {
+		end = total
+	}
+
+	var sections []channel.Section
+
+	// Page header — only shown when there are multiple pages.
+	if total > todosPerPage {
+		sections = append(sections, channel.Section{
+			Markdown: fmt.Sprintf("**任务** %d–%d / %d", start+1, end, total),
+		})
+	}
+
+	for _, t := range todos[start:end] {
+		icon := "🔲"
+		label := t.Content
 		switch t.Status {
 		case "completed":
-			fmt.Fprintf(&sb, "✅ ~~%s~~\n", t.Content)
+			icon = "✅"
 		case "in_progress":
-			fmt.Fprintf(&sb, "⏳ **%s**\n", t.Content)
-		default:
-			fmt.Fprintf(&sb, "🔲 %s\n", t.Content)
+			icon = "⏳"
+		}
+		sections = append(sections, channel.Section{
+			Buttons: []channel.Button{{
+				Label: icon + " " + label,
+				Style: "default",
+			}},
+		})
+	}
+
+	// Pagination navigation — only when there are multiple pages.
+	if total > todosPerPage {
+		var navBtns []channel.Button
+		if page > 0 {
+			navBtns = append(navBtns, channel.Button{
+				Label: "◀ 上一页", Style: "default",
+				Action: map[string]string{
+					"action":     "todo_page",
+					"session_id": sessID,
+					"page":       strconv.Itoa(page - 1),
+				},
+			})
+		}
+		if end < total {
+			navBtns = append(navBtns, channel.Button{
+				Label: "下一页 ▶", Style: "default",
+				Action: map[string]string{
+					"action":     "todo_page",
+					"session_id": sessID,
+					"page":       strconv.Itoa(page + 1),
+				},
+			})
+		}
+		if len(navBtns) > 0 {
+			sections = append(sections, channel.Section{Buttons: navBtns})
 		}
 	}
-	return strings.TrimRight(sb.String(), "\n")
+
+	return sections
 }
 
 // extractCurrentTool finds the most recent tool_use block in an assistant

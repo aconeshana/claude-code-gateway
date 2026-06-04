@@ -122,6 +122,13 @@ type Bridge struct {
 	// projectsForUser fallback (deriving from session.WorkingDir) picks
 	// it up permanently.
 	manualProjects map[string]map[string]bool
+
+	// activeStreams: session_id → live streamState, registered for the
+	// duration of streamSession so todo_page actions can update the page.
+	activeStreams map[string]*streamState
+	// sessionTodos: last-known todo list per session (survives stream end so
+	// Done-card pagination still works after the goroutine exits).
+	sessionTodos map[string][]todoItem
 }
 
 // DiscoveryStats holds the latest scan progress (read by /status).
@@ -160,6 +167,8 @@ func New(opts Options) *Bridge {
 		pendingElicitations: make(map[string]*PendingElicitation),
 		terminating:         make(map[string]bool),
 		manualProjects:      make(map[string]map[string]bool),
+		activeStreams:        make(map[string]*streamState),
+		sessionTodos:        make(map[string][]todoItem),
 	}
 	if opts.AdminModel != "" {
 		b.admin = newAdmin(opts.Manager, opts.DefaultCWD, opts.AdminModel)
@@ -1145,4 +1154,51 @@ func channelKindToOrigin(kind string) string {
 	default:
 		return kind
 	}
+}
+
+// registerStream marks a streamState as active for the given session ID.
+// Called at the start of streamSession so card-action handlers can locate
+// the live render state and update todosPage without a full restart.
+func (b *Bridge) registerStream(sessID string, s *streamState) {
+	b.mu.Lock()
+	b.activeStreams[sessID] = s
+	b.mu.Unlock()
+}
+
+// unregisterStream removes a session from the active-stream registry.
+// Called via defer in streamSession.
+func (b *Bridge) unregisterStream(sessID string) {
+	b.mu.Lock()
+	delete(b.activeStreams, sessID)
+	b.mu.Unlock()
+}
+
+// getActiveStream returns the live streamState for sessID, or nil.
+func (b *Bridge) getActiveStream(sessID string) *streamState {
+	b.mu.Lock()
+	s := b.activeStreams[sessID]
+	b.mu.Unlock()
+	return s
+}
+
+// storeSessionTodos persists the last-known todo list for sessID so
+// todo_page actions can re-render Done cards after the stream goroutine exits.
+func (b *Bridge) storeSessionTodos(sessID string, todos []todoItem) {
+	b.mu.Lock()
+	if len(todos) == 0 {
+		delete(b.sessionTodos, sessID)
+	} else {
+		cp := make([]todoItem, len(todos))
+		copy(cp, todos)
+		b.sessionTodos[sessID] = cp
+	}
+	b.mu.Unlock()
+}
+
+// getSessionTodos returns the last-known todos for sessID, or nil.
+func (b *Bridge) getSessionTodos(sessID string) []todoItem {
+	b.mu.Lock()
+	todos := b.sessionTodos[sessID]
+	b.mu.Unlock()
+	return todos
 }
