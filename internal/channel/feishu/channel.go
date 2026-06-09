@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -725,13 +726,31 @@ func (c *Channel) onCardAction(ctx context.Context, event *callback.CardActionTr
 	}
 
 	// Form submit: Lark sends only form_value + button.name (Value is nil).
-	// We encode "<action>:<key>" into the submit button name; decode it here
-	// so the bridge can route the submission like a normal action.
+	// Two encoding formats are accepted (see cards.go::encodeSubmitName):
+	//   1. querystring (preferred): "action=X&behavior=Y&source=Z" — every
+	//      key/value goes into values{}. Recognized by the presence of "=".
+	//   2. legacy two-field: "<action>:<key>" — kept for back-compat with
+	//      older callers (e.g. /config form) that only need action+key.
 	if actionName == "" && len(action.FormValue) > 0 && action.Name != "" {
-		if idx := strings.IndexByte(action.Name, ':'); idx > 0 {
-			actionName = action.Name[:idx]
-			values["action"] = actionName
-			values["key"] = action.Name[idx+1:]
+		if strings.Contains(action.Name, "=") {
+			parsed, err := url.ParseQuery(action.Name)
+			if err == nil {
+				for k, vs := range parsed {
+					if len(vs) > 0 {
+						values[k] = vs[0]
+					}
+				}
+				if a, ok := values["action"].(string); ok {
+					actionName = a
+				}
+			}
+		}
+		if actionName == "" {
+			if idx := strings.IndexByte(action.Name, ':'); idx > 0 {
+				actionName = action.Name[:idx]
+				values["action"] = actionName
+				values["key"] = action.Name[idx+1:]
+			}
 		}
 	}
 
@@ -742,12 +761,25 @@ func (c *Channel) onCardAction(ctx context.Context, event *callback.CardActionTr
 		replyCard *channel.Card
 	)
 
+	// Lark's card-action Context only carries OpenChatID/OpenMessageID.
+	// Thread routing (which the bridge needs to keep card-button replies
+	// inside the same thread as the original card) requires ThreadId /
+	// RootId / ParentId, so we fetch the source message via the IM API
+	// and project those fields into the InboundMessage. ~100ms latency
+	// per card action; acceptable for the correctness it buys, and can
+	// be cached later if it becomes a hot path.
+	threadID, rootID, parentID, isGroup := c.lookupCardMessageContext(ctx, cardMsgID)
+
 	inbound := channel.InboundMessage{
 		ChannelKind: channel.KindFeishu,
 		UserID:      userID,
 		ChatID:      chatID,
 		MessageID:   cardMsgID,
 		Kind:        channel.InputCardAction,
+		ThreadID:    threadID,
+		RootID:      rootID,
+		ParentID:    parentID,
+		IsGroup:     isGroup,
 		Action: &channel.CardAction{
 			Name:      actionName,
 			Values:    values,
@@ -984,4 +1016,114 @@ func derefStr(s *string) string {
 		return ""
 	}
 	return *s
+}
+
+// lookupCardMessageContext fetches a card message's thread routing
+// context via the IM API. Used during card-action handling where Lark's
+// CardActionTrigger event only carries OpenChatID/OpenMessageID — the
+// containing thread/root/parent IDs we need for routing replies are
+// only available through GET /im/v1/messages/{id}.
+//
+// Returns zero-values on any failure (missing message, API error,
+// permission denied) so the caller can degrade to "no thread" rather
+// than fail the card action. Errors are logged at debug level only —
+// SendFile uploads data as a stream file and sends it as a Lark file message.
+// When replyToMsgID is non-empty the file is delivered as a reply (thread-aware);
+// otherwise it is sent as a standalone message to chatID.
+// It implements channel.FileSender.
+func (c *Channel) SendFile(ctx context.Context, chatID, replyToMsgID, filename string, data []byte) (string, error) {
+	uploadReq := larkim.NewCreateFileReqBuilder().
+		Body(larkim.NewCreateFileReqBodyBuilder().
+			FileType(larkim.CreateFileFileTypeStream).
+			FileName(filename).
+			File(strings.NewReader(string(data))).
+			Build()).
+		Build()
+
+	uploadResp, err := c.client.Im.File.Create(ctx, uploadReq)
+	if err != nil {
+		return "", fmt.Errorf("upload file: %w", err)
+	}
+	if !uploadResp.Success() {
+		return "", fmt.Errorf("upload file: code=%d msg=%s", uploadResp.Code, uploadResp.Msg)
+	}
+	if uploadResp.Data == nil || uploadResp.Data.FileKey == nil {
+		return "", fmt.Errorf("upload file: empty file_key in response")
+	}
+	fileKey := *uploadResp.Data.FileKey
+	content, _ := json.Marshal(map[string]string{"file_key": fileKey})
+
+	if replyToMsgID != "" {
+		req := larkim.NewReplyMessageReqBuilder().
+			MessageId(replyToMsgID).
+			Body(larkim.NewReplyMessageReqBodyBuilder().
+				MsgType("file").
+				Content(string(content)).
+				Build()).
+			Build()
+		resp, err := c.client.Im.Message.Reply(ctx, req)
+		if err != nil {
+			return "", fmt.Errorf("reply file message: %w", err)
+		}
+		if !resp.Success() {
+			return "", fmt.Errorf("reply file message: code=%d msg=%s", resp.Code, resp.Msg)
+		}
+		if resp.Data == nil || resp.Data.MessageId == nil {
+			return "", nil
+		}
+		return *resp.Data.MessageId, nil
+	}
+
+	req := larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType("chat_id").
+		Body(larkim.NewCreateMessageReqBodyBuilder().
+			ReceiveId(chatID).
+			MsgType("file").
+			Content(string(content)).
+			Build()).
+		Build()
+	resp, err := c.client.Im.Message.Create(ctx, req)
+	if err != nil {
+		return "", fmt.Errorf("send file message: %w", err)
+	}
+	if !resp.Success() {
+		return "", fmt.Errorf("send file message: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	if resp.Data == nil || resp.Data.MessageId == nil {
+		return "", nil
+	}
+	return *resp.Data.MessageId, nil
+}
+
+// this is best-effort enrichment, not a load-bearing call.
+//
+// isGroup is derived from the chat type (currently best-effort: Lark's
+// GetMessage doesn't return chat_type directly; if a downstream feature
+// truly needs IsGroup on card actions, switch to GetChat). Returns
+// false here.
+func (c *Channel) lookupCardMessageContext(ctx context.Context, msgID string) (threadID, rootID, parentID string, isGroup bool) {
+	if msgID == "" {
+		return
+	}
+	req := larkim.NewGetMessageReqBuilder().MessageId(msgID).Build()
+	resp, err := c.client.Im.Message.Get(ctx, req)
+	if err != nil {
+		log.Printf("[channel/feishu] lookup card msg %s: %v", shortID(msgID), err)
+		return
+	}
+	if resp == nil || !resp.Success() || resp.Data == nil || len(resp.Data.Items) == 0 {
+		return
+	}
+	msg := resp.Data.Items[0]
+	if msg.ThreadId != nil {
+		threadID = *msg.ThreadId
+	}
+	if msg.RootId != nil {
+		rootID = *msg.RootId
+	}
+	if msg.ParentId != nil {
+		parentID = *msg.ParentId
+	}
+	// ChatType isn't exposed on Message; conservative default.
+	return
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/anthropics/claude-code-gateway/internal/channel"
 	"github.com/anthropics/claude-code-gateway/internal/protocol"
+	claudeRT "github.com/anthropics/claude-code-gateway/internal/runtime/claude"
 	"github.com/anthropics/claude-code-gateway/internal/session"
 )
 
@@ -477,7 +478,10 @@ func (b *Bridge) processingCardWithProgress(project, sessionShort, summary, mode
 	if summary != "" {
 		note = summary + " | " + hud
 	}
-	sections := []channel.Section{{Markdown: content}}
+	var sections []channel.Section
+	if content != "" {
+		sections = append(sections, channel.Section{Markdown: content})
+	}
 	if md := renderTodosMarkdown(todos); md != "" {
 		sections = append(sections, channel.Section{Markdown: md})
 	}
@@ -520,12 +524,19 @@ func (b *Bridge) resultCardWithIDAndInterrupt(project, sessionShort, summary, mo
 	duration := fmt.Sprintf("%.1fs", float64(result.DurationMS)/1000)
 	cost := fmt.Sprintf("$%.4f", result.TotalCostUSD)
 	stats := fmt.Sprintf("%s | %d turns | %s", duration, result.NumTurns, cost)
-	hud := buildHUDNote(model, gitBranch, contextPct, stats)
+	hudCtxPct := contextPct
+	if result.NumTurns == 0 {
+		hudCtxPct = -1
+	}
+	hud := buildHUDNote(model, gitBranch, hudCtxPct, stats)
 	note := hud
 	if summary != "" {
 		note = summary + " | " + hud
 	}
-	sections := []channel.Section{{Markdown: content}}
+	var sections []channel.Section
+	if content != "" {
+		sections = append(sections, channel.Section{Markdown: content})
+	}
 	if md := renderTodosMarkdown(todos); md != "" {
 		sections = append(sections, channel.Section{Markdown: md})
 	}
@@ -838,7 +849,11 @@ func shortModelName(model string) string {
 }
 
 // hudContextBar renders a 10-char bar plus percentage: "████░░░░░░ 45%"
+// Pass pct=-1 to render an empty bar with "compacted" label instead of a number.
 func hudContextBar(pct int) string {
+	if pct == -1 {
+		return strings.Repeat("░", 10) + " compacted"
+	}
 	if pct < 0 {
 		pct = 0
 	}
@@ -888,7 +903,14 @@ func (b *Bridge) handleControlRequest(ctx context.Context, sess *session.Session
 	case "EnterPlanMode", "ExitPlanMode":
 		b.handlePlanPermission(ctx, sess, chatID, raw, inner.ToolName)
 	default:
-		log.Printf("[bridge] unhandled control_request tool: %s", inner.ToolName)
+		// In auto mode the session layer already responded allow to the CLI;
+		// the broadcast exists only for WS-transport observers. Skip the card.
+		if sess.Info().PermissionMode == claudeRT.PermissionAuto {
+			return
+		}
+		// Forward-mode: render a generic approval card with allow/deny/always-allow
+		// buttons. Without this branch the CLI hangs in StateWaitingPermission.
+		b.handleToolPermission(ctx, sess, chatID, raw, inner.ToolName)
 	}
 }
 

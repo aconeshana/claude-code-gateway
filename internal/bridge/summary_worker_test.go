@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -15,52 +16,53 @@ import (
 // admin-detection scheme. The worker prompt MUST start (or near-start) with
 // AdminSessionMarker — otherwise admin-spawned sessions are only detected
 // by cwd-prefix, losing the fingerprint fallback. A future refactor that
-// rewrites buildSummaryPrompt and forgets the marker would silently
+// rewrites buildRecapPrompt and forgets the marker would silently
 // regress; this test catches that.
 //
 // Also asserts the marker is identical to what runtime/claude/discoverer.go
 // looks for (cross-package coupling, see adminPromptFingerprints).
 func TestBuildSummaryPrompt_InjectsAdminMarker(t *testing.T) {
-	prompt := buildSummaryPrompt("/some/path.jsonl")
+	// Write a minimal JSONL file with one user turn so buildRecapPrompt
+	// doesn't early-return "" (it returns "" for empty/missing files).
+	f, err := os.CreateTemp(t.TempDir(), "*.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := `{"type":"user","isMeta":false,"isSidechain":false,"message":{"role":"user","content":"test prompt"}}` + "\n"
+	if _, err := f.WriteString(line); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	prompt := buildRecapPrompt(f.Name())
 	if !strings.Contains(prompt, AdminSessionMarker) {
 		t.Fatalf("prompt missing AdminSessionMarker %q — admin-session fingerprint detection will silently break for sessions spawned outside /tmp", AdminSessionMarker)
 	}
-	// Marker should appear exactly once — the discoverer counts it as a
-	// boolean signal; duplicates won't hurt correctness but suggest the
-	// prompt structure drifted.
 	if strings.Count(prompt, AdminSessionMarker) != 1 {
 		t.Errorf("AdminSessionMarker should appear once, got %d", strings.Count(prompt, AdminSessionMarker))
 	}
 }
 
-func TestCleanAdminSummary_StripsPrefixesAndQuotes(t *testing.T) {
+func TestCleanSummaryOutput_StripsPrefixesAndQuotes(t *testing.T) {
 	cases := []struct {
 		name, in, want string
 	}{
-		// Primary path: tag extraction
-		{"tag only", "<summary>修复 CI 流程</summary>", "修复 CI 流程"},
-		{"tag after preamble", "让我分析一下...\n根据日志:\n<summary>调试 worker 限速</summary>", "调试 worker 限速"},
-		{"tag with newlines inside", "<summary>修复\n飞书\n卡片</summary>", "修复\n飞书\n卡片"},
-		{"tag with surrounding text", "好的,这是答案:\n\n<summary>重构 session manager</summary>\n\n说明: 略", "重构 session manager"},
-		{"tag with wrapping quotes inside", `<summary>"修复 bug"</summary>`, "修复 bug"},
-
-		// No tag → empty (strict, no fallback). Polluting summaries with
-		// last-line heuristics caused the v6 disaster.
-		{"no tag plain text", "已修复 bug", ""},
-		{"no tag with preamble", "Summary: 添加摘要功能", ""},
-		{"no tag truncated mid-sentence", "现在我明白了。这个 session 是在...", ""},
+		// Plain text output — the new contract: admin writes directly.
+		{"plain text", "You're fixing the CI pipeline in summary_worker.go.", "You're fixing the CI pipeline in summary_worker.go."},
+		{"strips surrounding whitespace", "  修复 CI 流程  ", "修复 CI 流程"},
+		{"strips backtick wrapping", "`调试 worker 限速`", "调试 worker 限速"},
+		{"strips double-quote wrapping", `"重构 session manager"`, "重构 session manager"},
+		{"strips single-quote wrapping", `'修复 bug'`, "修复 bug"},
+		{"multiline kept", "你在重构 session manager。\n下一步是更新 persist 层。", "你在重构 session manager。\n下一步是更新 persist 层。"},
 		{"empty", "", ""},
 		{"only whitespace", "   \n\n  ", ""},
-		// Truncated tag (the actual v6 failure mode — admin wrote thinking
-		// >60 runes and our cap chopped the closing tag).
-		{"truncated tag start", "<summary>真正摘要", ""},
-		{"truncated tag end", "summary>实际摘要</summa", ""},
+		{"skip meta sentinel", "_skip_meta_", "_skip_meta_"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got := cleanAdminSummary(c.in)
+			got := cleanSummaryOutput(c.in)
 			if got != c.want {
-				t.Errorf("cleanAdminSummary(%q) = %q, want %q", c.in, got, c.want)
+				t.Errorf("cleanSummaryOutput(%q) = %q, want %q", c.in, got, c.want)
 			}
 		})
 	}

@@ -117,3 +117,35 @@ func humanSize(n int64) string {
 		return fmt.Sprintf("%.1f MB", float64(n)/(1024*1024))
 	}
 }
+
+// handlePlanCardAction dispatches show_plan (drill-in from /plan-list) and
+// plan_response (allow/deny on an ExitPlanMode prompt). Returns true when
+// the action was claimed.
+func (b *Bridge) handlePlanCardAction(ctx context.Context, m channel.InboundMessage) bool {
+	switch m.Action.Name {
+	case "show_plan":
+		if filename, ok := m.Action.Values["filename"].(string); ok {
+			// plan-list embeds thread context into the button payload because
+			// Lark card-action events don't carry it; restore it onto m so
+			// replyCard posts the detail card back into the originating
+			// thread instead of leaking to the main chat.
+			if tid, _ := m.Action.Values["thread_id"].(string); tid != "" {
+				m.ThreadID = tid
+				if rid, _ := m.Action.Values["root_id"].(string); rid != "" {
+					m.RootID = rid
+					m.MessageID = rid
+				}
+			}
+			b.showPlanDetail(ctx, m, filename)
+		}
+	case "plan_response":
+		pendingID, _ := m.Action.Values["pending_id"].(string)
+		result, _ := m.Action.Values["result"].(string)
+		if pendingID != "" && result != "" {
+			b.handlePlanResponse(ctx, m.ChatID, pendingID, result)
+		}
+	default:
+		return false
+	}
+	return true
+}

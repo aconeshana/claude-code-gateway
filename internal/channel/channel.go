@@ -67,6 +67,23 @@ type InboundHandler interface {
 	OnMessage(ctx context.Context, m InboundMessage)
 }
 
+// FileSender is an optional capability for channels that can send files
+// (e.g. Feishu file messages). Bridges detect support via type assertion:
+//
+//	if fs, ok := ch.(channel.FileSender); ok { ... }
+//
+// Channels without file support (e.g. WS) fall back to sending the content
+// as plain text.
+type FileSender interface {
+	// SendFile uploads data as a file and delivers it to chatID.
+	// filename is the suggested display name (e.g. "conversation-20260605.txt").
+	// replyToMsgID, when non-empty, anchors the file message as a reply (so it
+	// lands in the same thread as the triggering message on platforms that
+	// support threads, e.g. Feishu). Pass "" to post as a standalone message.
+	// Returns the platform message id.
+	SendFile(ctx context.Context, chatID, replyToMsgID, filename string, data []byte) (messageID string, err error)
+}
+
 // ThreadOpener is an optional capability for channels that support threads
 // (currently Feishu / Lark). Bridges detect support via type assertion:
 //

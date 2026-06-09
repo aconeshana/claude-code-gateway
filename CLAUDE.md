@@ -170,6 +170,28 @@ internal/
 
 新增字段时,在 `Session` 结构体加字段,同时在 `Info()` 拷贝到 `SessionInfo`,manager 提供 `SetXxx(sessionID, val) error` setter,**同步更新 `docs/SESSION_STATE.md`**。
 
+### 命令的 Session 解析策略
+
+命令按是否需要 **活跃 CLI 进程** 分两类:
+
+| 类型 | 代表命令 | session 解析方式 |
+|------|---------|----------------|
+| **只读元数据型**（读 JSONL / working dir，不需要进程） | `/export` `/recap` `/diff` `/shell` | thread-bound → `FocusedSession` → `ResolveResumable`（不 reactivate，直接用元数据） |
+| **需要活跃进程型**（发消息给 CLI） | 普通消息、`/branch`、`/stop` 等 | `ensureCurrentSession(mustBeActive=false/true)`（会触发 Reactivate） |
+
+**只读型命令的标准 session 解析模板**（见 `export_command.go::exportTargetSession`）:
+
+```go
+if m.ThreadID != "" {
+    if sess, ok := b.mgr.GetByThreadID(m.ThreadID); ok { return sess, true }
+}
+if sess, ok := b.mgr.FocusedSession(m.UserID); ok { return sess, true }
+if sess := b.mgr.ResolveResumable(m.UserID); sess != nil { return sess, true }
+return nil, false
+```
+
+**不要**在只读命令里调 `ensureCurrentSession` —— 那会 reactivate 进程，产生不必要的 CLI 启动开销。
+
 ### Command Registry
 
 `internal/bridge/command.go::Command` 是 slash 命令的注册结构。新增命令:
@@ -242,7 +264,7 @@ pick_dir_confirm (path, purpose) → handlePickDirConfirm
 | `GATEWAY_MAX_SESSIONS` | `10` | 最大并发 session 数 |
 | `GATEWAY_AUTH_TOKEN` | (空) | WS Bearer Token |
 | `SUMMARY_INTERVAL` | `5` | 多少**条用户消息**后自动重生成摘要(0=关闭) |
-| `ADMIN_MODEL` | `claude-haiku-4-5` | 摘要 / 模糊匹配用的 admin 模型(**生产建议 `claude-sonnet-4-6`**,质量 10/10 vs haiku 7-8/10) |
+| `ADMIN_MODEL` | `claude-haiku-4-5` | 摘要 / 模糊匹配用的 admin 模型(v8 prompt 去掉 jq 依赖后 haiku 与 sonnet 质量相当) |
 | `GATEWAY_SHARE_EXTERNAL_SESSIONS` | `false` | 是否展示 terminal/SDK 等创建的 external session |
 | `GATEWAY_DISCOVERY_WINDOW_DAYS` | `7` | 磁盘扫描时间窗口(天),0=全量 |
 | `GATEWAY_DISCOVERY_RESCAN_INTERVAL` | `5m` | 重新扫描间隔 |
@@ -388,8 +410,8 @@ pick_dir_confirm (path, purpose) → handlePickDirConfirm
 | 检测层 | 信号 | 何时生效 | 稳定性 |
 |--------|------|---------|--------|
 | **主:cwd 前缀** | `WorkingDir == /tmp/claude-code-gateway-admin` | admin session 跑在这个隔离目录 | 永久稳定,不依赖 prompt |
-| **备:fingerprint 主选** | `[GATEWAY_ADMIN_SESSION_v1]` 出现在 jsonl head/tail | `buildSummaryPrompt` 头部强制注入此 marker | 稳定 — marker 与 prompt 文本解耦 |
-| **备:fingerprint legacy** | "总结一个 claude-code session" / `jq -r 'select` 等 | 老 prompt 版本写的 admin session | 会随 prompt 改而失效,只作一次性历史清理 |
+| **备:fingerprint 主选** | `[GATEWAY_ADMIN_SESSION_v1]` 出现在 jsonl head/tail | `buildRecapPrompt` 头部强制注入此 marker | 稳定 — marker 与 prompt 文本解耦 |
+| **备:fingerprint legacy** | "总结一个 claude-code session" / `jq -r 'select` 等 | v7 及更早 prompt 版本写的 admin session | 会随 prompt 改而失效,只作一次性历史清理 |
 
 **保护机制**:
 - `summary_worker_test.go::TestBuildSummaryPrompt_InjectsAdminMarker` 强制 prompt 含 marker — prompt 重写漏掉 marker 单测会红

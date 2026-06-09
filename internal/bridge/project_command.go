@@ -427,3 +427,49 @@ func pickDirReturnButton(purpose string) *channel.Button {
 	}
 	return nil
 }
+
+// handleProjectCardAction is the dispatcher entry for project / picker card
+// buttons. Returns true when m.Action.Name was claimed by this domain.
+func (b *Bridge) handleProjectCardAction(ctx context.Context, m channel.InboundMessage) bool {
+	switch m.Action.Name {
+	case "pick_dir":
+		b.handlePickDir(ctx, m)
+	case "pick_dir_confirm":
+		b.handlePickDirConfirm(ctx, m)
+	case "show_projects":
+		card := b.buildProjectsCard(m.UserID)
+		if m.Reply != nil {
+			m.Reply(card)
+		} else {
+			b.replyCard(ctx, m, card)
+		}
+	case "new_session_in":
+		dir, _ := m.Action.Values["working_dir"].(string)
+		b.newSessionInDir(ctx, m, dir)
+	case "cmd_new":
+		// Top-level "新建会话" button on the /list card — focus-aware:
+		// has focus → create in focus dir + open thread; no focus → projects picker.
+		b.cmdNew(ctx, m, "")
+	case "show_project":
+		dir, _ := m.Action.Values["working_dir"].(string)
+		if dir == "" {
+			return true
+		}
+		returnTo, _ := m.Action.Values["return_to"].(string)
+		b.replyWithProjectCard(ctx, m, dir, false, returnTo)
+	case "show_project_archived":
+		dir, _ := m.Action.Values["working_dir"].(string)
+		if dir == "" {
+			return true
+		}
+		returnTo, _ := m.Action.Values["return_to"].(string)
+		b.replyWithProjectCard(ctx, m, dir, true, returnTo)
+	case "back_to_list":
+		// Back-button payloads on cards rendered before the /list and /project
+		// merge still use "back_to_list" — route to the merged projects card.
+		b.replyWithProjectsCard(ctx, m)
+	default:
+		return false
+	}
+	return true
+}

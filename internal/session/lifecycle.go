@@ -402,6 +402,50 @@ func (m *Manager) SetResumeHint(ownerID, cliSessionID string) {
 	m.idx.setResumeHint(ownerID, cliSessionID)
 }
 
+// AddSessionDir appends dir to the session's ExtraAddDirs (deduplicated) and
+// respawns the CLI if the session is active so the change takes effect
+// immediately. For idle/archived sessions the dir is stored and applied on the
+// next Reactivate. Callers should Save state after a successful call.
+//
+// dir must be an absolute path; the bridge layer (cmdAddDir) is responsible
+// for validating existence and type before calling here.
+// TODO(security): enforce m.allowedBaseDirs once validateWorkingDir is made
+// non-trivial — currently that check is a no-op so enforcement is deferred.
+func (m *Manager) AddSessionDir(sessionID, dir string) error {
+	sess, ok := m.Get(sessionID)
+	if !ok {
+		return fmt.Errorf("session %s not found", sessionID)
+	}
+	sess.mu.Lock()
+	for _, d := range sess.ExtraAddDirs {
+		if d == dir {
+			sess.mu.Unlock()
+			return nil // already present, nothing to do
+		}
+	}
+	newDirs := make([]string, len(sess.ExtraAddDirs)+1)
+	copy(newDirs, sess.ExtraAddDirs)
+	newDirs[len(sess.ExtraAddDirs)] = dir
+	sess.ExtraAddDirs = newDirs
+	isActive := sess.Status == StatusActive
+	sess.mu.Unlock()
+
+	if !isActive {
+		return nil // dir persisted; takes effect on next Reactivate
+	}
+	// Re-fetch through manager: a concurrent Reactivate may have replaced the
+	// session object (new ID, new process) after we released sess.mu. If so
+	// ExtraAddDirs is already on the new object and we skip the respawn here —
+	// the Reactivate already spawned with the dir (it reads ExtraAddDirs under
+	// old.mu before we released). If no swap happened, live == sess and we
+	// respawn normally.
+	live, ok := m.Get(sessionID)
+	if !ok || live != sess || live.Info().Status != string(StatusActive) {
+		return nil
+	}
+	return live.AddDir(dir)
+}
+
 // FindByPrefix looks up a session for owner by either:
 //   - the leading characters of its gateway UUID (sess.ID)
 //   - the leading characters of its CLI session id (sess.CLISessionID) —
@@ -552,11 +596,12 @@ func (m *Manager) Reactivate(ctx context.Context, sessionID string) (*Session, e
 	cliID := old.CLISessionID
 	threadID := old.ThreadID
 	rootMessageID := old.RootMessageID
+	extraAddDirs := append([]string(nil), old.ExtraAddDirs...)
 	old.mu.Unlock()
 
 	req := runtime.SpawnRequest{
 		WorkingDir: workingDir,
-		Config:     claude.Config{PermissionMode: m.defaultPermMode},
+		Config:     claude.Config{PermissionMode: m.defaultPermMode, AddDirs: extraAddDirs},
 		ResumeID:   cliID,
 	}
 	sess, spawnErr := NewSession(m.rt, req, m.defaultPermMode, m.keepAliveInterval)
@@ -581,6 +626,7 @@ func (m *Manager) Reactivate(ctx context.Context, sessionID string) (*Session, e
 	// pinging the existing one.
 	sess.ThreadID = threadID
 	sess.RootMessageID = rootMessageID
+	sess.ExtraAddDirs = extraAddDirs
 	// CLISessionID is normally populated when the runtime emits its init
 	// message, but for resume we already know it (it's what we passed to
 	// --resume). Set it eagerly so operations that need it — SwitchModel,
@@ -662,6 +708,7 @@ type ImportOpts struct {
 	ChannelKind       string
 	ThreadID          string
 	RootMessageID     string
+	ExtraAddDirs      []string
 	MessageCount      int
 	CreatedAt         time.Time
 	ArchivedAt        time.Time
@@ -715,6 +762,9 @@ func (m *Manager) importSession(opts ImportOpts, status Status) (string, error) 
 			if opts.RootMessageID != "" {
 				sess.RootMessageID = opts.RootMessageID
 			}
+			if len(opts.ExtraAddDirs) > 0 {
+				sess.ExtraAddDirs = opts.ExtraAddDirs
+			}
 			if opts.MessageCount > 0 {
 				sess.MessageCount = opts.MessageCount
 			}
@@ -741,6 +791,7 @@ func (m *Manager) importSession(opts ImportOpts, status Status) (string, error) 
 		ChannelKind:       opts.ChannelKind,
 		ThreadID:          opts.ThreadID,
 		RootMessageID:     opts.RootMessageID,
+		ExtraAddDirs:      opts.ExtraAddDirs,
 		MessageCount:      opts.MessageCount,
 		Status:            status,
 		CreatedAt:         coalesceTime(opts.CreatedAt),

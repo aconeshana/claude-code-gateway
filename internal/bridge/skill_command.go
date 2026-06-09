@@ -219,24 +219,22 @@ func parseFrontmatter(block string) map[string]string {
 // --- /skills command ---
 
 func (b *Bridge) cmdSkills(ctx context.Context, m channel.InboundMessage) {
-	card := b.buildSkillsCard(m.UserID)
+	card := b.buildSkillsCard(m)
 	b.replyCard(ctx, m, card)
 }
 
-func (b *Bridge) skillsWorkingDir(userID string) string {
-	if sess, ok := b.mgr.FocusedSession(userID); ok {
-		if d := sess.Info().WorkingDir; d != "" {
-			return d
-		}
+func (b *Bridge) skillsWorkingDir(m channel.InboundMessage) string {
+	if wd := b.currentProjectDir(m); wd != "" {
+		return wd
 	}
-	if b.defaultCWD != "" && b.defaultCWD != "." {
-		return b.defaultCWD
-	}
+	// Skills scan tolerates a missing project context: fall back to $HOME
+	// so the user always sees their global skills even when no session is
+	// focused and no defaultCWD is set.
 	return homeDir()
 }
 
-func (b *Bridge) buildSkillsCard(userID string) channel.Card {
-	wd := b.skillsWorkingDir(userID)
+func (b *Bridge) buildSkillsCard(m channel.InboundMessage) channel.Card {
+	wd := b.skillsWorkingDir(m)
 	skills := scanSkills(wd)
 	globalPrefix := filepath.Join(homeDir(), ".claude", "skills") + string(filepath.Separator)
 
@@ -292,7 +290,7 @@ func (b *Bridge) showSkillDetail(ctx context.Context, m channel.InboundMessage) 
 		b.replyOrText(ctx, m, "skill 名称缺失")
 		return
 	}
-	wd := b.skillsWorkingDir(m.UserID)
+	wd := b.skillsWorkingDir(m)
 	var found *skillEntry
 	for _, s := range scanSkills(wd) {
 		if s.Name == name {
@@ -451,10 +449,26 @@ func (b *Bridge) buildSkillExecutedCard(name, userInput string, success bool, no
 // --- action: back_to_skills ---
 
 func (b *Bridge) replyWithSkillsCard(ctx context.Context, m channel.InboundMessage) {
-	card := b.buildSkillsCard(m.UserID)
+	card := b.buildSkillsCard(m)
 	if m.Reply != nil {
 		m.Reply(card)
 		return
 	}
 	b.replyCard(ctx, m, card)
+}
+
+// handleSkillCardAction is the dispatcher entry for skill-related card buttons.
+// Returns true when m.Action.Name was claimed by this domain.
+func (b *Bridge) handleSkillCardAction(ctx context.Context, m channel.InboundMessage) bool {
+	switch m.Action.Name {
+	case "show_skill":
+		b.showSkillDetail(ctx, m)
+	case "run_skill":
+		b.runSkill(ctx, m)
+	case "back_to_skills":
+		b.replyWithSkillsCard(ctx, m)
+	default:
+		return false
+	}
+	return true
 }

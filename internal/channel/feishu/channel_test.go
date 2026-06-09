@@ -97,8 +97,9 @@ func TestRenderCard_FormAndSubmit(t *testing.T) {
 // and the user-visible symptom is that the "修改" button silently fails to
 // open the edit card.
 //
-// We encode "<action>:<key>" into the submit button name so the bridge can
-// route form submissions back (Lark drops button.value during form submit).
+// We encode the entire Action map as a querystring into button.name so the
+// bridge can route form submissions back (Lark drops button.value on form
+// submit). Two-field case: action + key both appear in alphabetical key order.
 func TestRenderCard_FormSubmitNameDistinctFromForm(t *testing.T) {
 	out := renderCard(channel.Card{
 		Title: "Config",
@@ -114,13 +115,63 @@ func TestRenderCard_FormSubmitNameDistinctFromForm(t *testing.T) {
 		t.Errorf("form name missing: %s", out)
 	}
 	// submit button name must be different from form name (Lark API constraint)
-	// AND encode the routing info since Lark drops button.value on form submit
-	if !contains(out, `"name":"save_config:MY_KEY"`) {
-		t.Errorf("submit button name should encode <action>:<key>: %s", out)
+	// AND encode the routing info since Lark drops button.value on form submit.
+	// Keys are sorted alphabetically so the encoding is deterministic.
+	// Go's json encoder html-escapes & as the 6-char & escape.
+	if !contains(out, `"name":"action=save_config&key=MY_KEY"`) {
+		t.Errorf("submit button name should be querystring with sorted keys: %s", out)
 	}
 	// Sanity: form-level name appears exactly once.
 	if strings.Count(out, `"name":"config_form"`) != 1 {
 		t.Errorf("form name should appear exactly once, output: %s", out)
+	}
+}
+
+// TestRenderCard_FormSubmitMultiField pins the multi-field encoding —
+// this is the bug that the original two-field "<action>:<key>" format
+// silently dropped (any extra Action key like behavior/source/pattern
+// would never reach the bridge).
+func TestRenderCard_FormSubmitMultiField(t *testing.T) {
+	out := renderCard(channel.Card{
+		Title: "Permissions",
+		Sections: []channel.Section{{
+			Form: &channel.Form{
+				FormID: "permissions_add_form",
+				Fields: []channel.FormField{{Name: "pattern", Placeholder: "Bash(...)"}},
+				Submit: channel.Button{Label: "Save", Action: map[string]string{
+					"action":   "permissions_add_submit",
+					"behavior": "allow",
+					"source":   "local",
+				}},
+			},
+		}},
+	})
+	// Keys are sorted: action, behavior, source.
+	want := `"name":"action=permissions_add_submit&behavior=allow&source=local"`
+	if !contains(out, want) {
+		t.Errorf("multi-field submit name encoding wrong:\nwant substring: %s\noutput: %s", want, out)
+	}
+}
+
+// TestRenderCard_FormSubmitURLEncodesSpecialChars verifies that special
+// chars in values (notably `=` and `&` which would otherwise corrupt the
+// querystring) are escaped. Without this, a pattern like "Bash(echo=hi)"
+// or a value with "&" would break the decode side.
+func TestRenderCard_FormSubmitURLEncodesSpecialChars(t *testing.T) {
+	out := renderCard(channel.Card{
+		Sections: []channel.Section{{
+			Form: &channel.Form{
+				FormID: "x",
+				Submit: channel.Button{Label: "S", Action: map[string]string{
+					"action": "do",
+					"value":  "a=b&c=d",
+				}},
+			},
+		}},
+	})
+	// url.QueryEscape: = → %3D, & → %26.
+	if !contains(out, `value=a%3Db%26c%3Dd`) {
+		t.Errorf("special chars not URL-escaped: %s", out)
 	}
 }
 
