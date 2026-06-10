@@ -41,10 +41,10 @@ func (b *Bridge) cmdExport(ctx context.Context, m channel.InboundMessage) {
 	filename := exportFilename(info)
 
 	if fs, ok := b.ch.(channel.FileSender); ok {
-		if _, err := fs.SendFile(ctx, m.ChatID, m.MessageID, filename, []byte(content)); err != nil {
-			b.replyText(ctx, m, fmt.Sprintf("发送文件失败: %v", err))
+		if _, err := fs.SendFile(ctx, m.ChatID, m.MessageID, filename, []byte(content)); err == nil {
+			return
 		}
-		return
+		// SendFile failed — fall through to text fallback below.
 	}
 
 	// Fallback for channels without file support: send as text (truncated).

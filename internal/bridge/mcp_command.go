@@ -64,7 +64,7 @@ func mcpServerSection(s claudefiles.MCPServer) channel.Section {
 
 	switch {
 	case s.URL != "":
-		fmt.Fprintf(&b, "\n`%s`", s.URL)
+		fmt.Fprintf(&b, "\n`%s`", redactURL(s.URL))
 	case s.Command != "":
 		invocation := s.Command
 		if len(s.Args) > 0 {

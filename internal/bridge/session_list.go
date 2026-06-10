@@ -119,20 +119,30 @@ func buildSessionListSections(sessions []session.SessionInfo, focusedID string) 
 }
 
 // buildArchivedSectionsWithDir is like buildArchivedSections but includes
-// working_dir in button payloads so the handler can navigate back to the
-// project view after resume/delete.
-func buildArchivedSectionsWithDir(archived []session.SessionInfo, dir string) []channel.Section {
+// working_dir and return_to in button payloads so the handler can navigate
+// back to the correct project view after resume/delete.
+func buildArchivedSectionsWithDir(archived []session.SessionInfo, dir string, returnTo ...string) []channel.Section {
+	rt := ""
+	if len(returnTo) > 0 {
+		rt = returnTo[0]
+	}
 	sections := make([]channel.Section, 0, len(archived))
 	for _, info := range archived {
 		header := renderSessionHeader(info, "")
 		body := renderSessionTitle(info)
 		md := header + "\n" + body
+		resumeAction := map[string]string{"action": "resume_archived", "session_id": sessionPayloadID(info), "working_dir": dir}
+		removeAction := map[string]string{"action": "remove_archived", "session_id": sessionPayloadID(info), "working_dir": dir}
+		if rt != "" {
+			resumeAction["return_to"] = rt
+			removeAction["return_to"] = rt
+		}
 		sections = append(sections, channel.Section{
 			Markdown:     md,
 			ButtonLayout: "fill",
 			Buttons: []channel.Button{
-				{Label: "恢复", Style: "primary", Action: map[string]string{"action": "resume_archived", "session_id": sessionPayloadID(info), "working_dir": dir}},
-				{Label: "删除", Style: "danger", Action: map[string]string{"action": "remove_archived", "session_id": sessionPayloadID(info), "working_dir": dir}},
+				{Label: "恢复", Style: "primary", Action: resumeAction},
+				{Label: "删除", Style: "danger", Action: removeAction},
 			},
 		})
 	}

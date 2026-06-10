@@ -34,10 +34,14 @@ type diffLine struct {
 
 func (b *Bridge) cmdDiff(ctx context.Context, m channel.InboundMessage) {
 	wd := b.defaultCWD
-	if focused, ok := b.mgr.FocusedSession(m.UserID); ok {
-		if focused.WorkingDir != "" {
-			wd = focused.WorkingDir
+	if m.ThreadID != "" {
+		if sess, ok := b.mgr.GetByThreadID(m.ThreadID); ok && sess.WorkingDir != "" {
+			wd = sess.WorkingDir
 		}
+	} else if focused, ok := b.mgr.FocusedSession(m.UserID); ok && focused.WorkingDir != "" {
+		wd = focused.WorkingDir
+	} else if sess := b.mgr.ResolveResumable(m.UserID); sess != nil && sess.WorkingDir != "" {
+		wd = sess.WorkingDir
 	}
 
 	diffCtx, cancel := context.WithTimeout(ctx, diffTimeout)
@@ -206,7 +210,12 @@ func (b *Bridge) handleDiffFileDetail(ctx context.Context, m channel.InboundMess
 	}
 	wd, _ := m.Action.Values["working_dir"].(string)
 	file, _ := m.Action.Values["file"].(string)
-	listPage, _ := strconv.Atoi(m.Action.Values["list_page"].(string))
+	listPage, _ := strconv.Atoi(func() string {
+		if v, ok := m.Action.Values["list_page"].(string); ok {
+			return v
+		}
+		return "0"
+	}())
 	if wd == "" || file == "" {
 		return
 	}
@@ -271,7 +280,9 @@ func runGit(ctx context.Context, dir string, args ...string) string {
 	var out bytes.Buffer
 	cmd.Stdout = &limitedWriter{buf: &out, limit: 64 * 1024}
 	cmd.Stderr = io.Discard
-	_ = cmd.Run()
+	if err := cmd.Run(); err != nil && out.Len() == 0 {
+		return ""
+	}
 	return out.String()
 }
 

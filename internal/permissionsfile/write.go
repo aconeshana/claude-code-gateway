@@ -204,8 +204,8 @@ func writeSettings(path string, doc map[string]json.RawMessage) error {
 	}
 	tmpName := tmp.Name()
 	cleanup := func() {
-		tmp.Close()
-		os.Remove(tmpName)
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
 	}
 	if _, err := tmp.Write(data); err != nil {
 		cleanup()

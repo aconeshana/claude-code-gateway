@@ -50,7 +50,7 @@ func (b *Bridge) cmdRecap(ctx context.Context, m channel.InboundMessage) {
 		b.replyText(ctx, m, "_(当前 session 内容较少，无法生成摘要)_")
 		return
 	}
-	b.replyText(ctx, m, "📋 **Session 摘要**\n\n"+summary)
+	b.replyText(ctx, m, "📋 **Session "+displaySessionID(sess)+" 摘要**\n\n"+summary)
 }
 
 // recapTargetSession resolves the session to recap: thread-bound session

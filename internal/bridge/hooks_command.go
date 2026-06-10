@@ -165,32 +165,28 @@ func redactCommand(raw string) string {
 	if trimmed == "" {
 		return ""
 	}
+	// Strip ALL leading KEY=value env assignments so the real binary name is
+	// visible, without leaking any secret values embedded in those assignments.
+	for {
+		idx := strings.IndexAny(trimmed, " \t")
+		if idx < 0 {
+			// Single token: if it's an env assign (no binary), hide it entirely.
+			if looksLikeEnvAssign(trimmed) {
+				return "…"
+			}
+			return trimmed
+		}
+		tok := trimmed[:idx]
+		if !looksLikeEnvAssign(tok) {
+			break
+		}
+		trimmed = strings.TrimLeft(trimmed[idx:], " \t")
+	}
 	idx := strings.IndexAny(trimmed, " \t")
 	if idx < 0 {
 		return trimmed
 	}
-	first := trimmed[:idx]
-	// Heuristic: peel a single leading `ENV=val` assignment so users see the
-	// real binary instead of just `FOO=bar`. Only peel when the NEXT token
-	// looks like a real command (no '=') — otherwise we risk hiding values
-	// inside a `KEY1=v1 KEY2=v2` chain that we shouldn't be unwrapping.
-	if looksLikeEnvAssign(first) {
-		rest := strings.TrimLeft(trimmed[idx:], " \t")
-		if rest != "" {
-			nextEnd := strings.IndexAny(rest, " \t")
-			nextTok := rest
-			if nextEnd >= 0 {
-				nextTok = rest[:nextEnd]
-			}
-			if !looksLikeEnvAssign(nextTok) {
-				if nextEnd >= 0 {
-					return nextTok + " …"
-				}
-				return nextTok
-			}
-		}
-	}
-	return first + " …"
+	return trimmed[:idx] + " …"
 }
 
 // looksLikeEnvAssign reports whether tok matches the shell `KEY=value`

@@ -1040,17 +1040,24 @@ func (c *Channel) SendFile(ctx context.Context, chatID, replyToMsgID, filename s
 			Build()).
 		Build()
 
-	uploadResp, err := c.client.Im.File.Create(ctx, uploadReq)
-	if err != nil {
+	var fileKey string
+	if err := c.withTokenRetry("SendFile/upload", func() (int, string, error) {
+		resp, err := c.client.Im.File.Create(ctx, uploadReq)
+		if err != nil {
+			return 0, "", err
+		}
+		if !resp.Success() {
+			return resp.Code, resp.Msg, nil
+		}
+		if resp.Data == nil || resp.Data.FileKey == nil {
+			return 0, "", fmt.Errorf("upload file: empty file_key in response")
+		}
+		fileKey = *resp.Data.FileKey
+		return 0, "", nil
+	}); err != nil {
 		return "", fmt.Errorf("upload file: %w", err)
 	}
-	if !uploadResp.Success() {
-		return "", fmt.Errorf("upload file: code=%d msg=%s", uploadResp.Code, uploadResp.Msg)
-	}
-	if uploadResp.Data == nil || uploadResp.Data.FileKey == nil {
-		return "", fmt.Errorf("upload file: empty file_key in response")
-	}
-	fileKey := *uploadResp.Data.FileKey
+
 	content, _ := json.Marshal(map[string]string{"file_key": fileKey})
 
 	if replyToMsgID != "" {
@@ -1061,17 +1068,24 @@ func (c *Channel) SendFile(ctx context.Context, chatID, replyToMsgID, filename s
 				Content(string(content)).
 				Build()).
 			Build()
-		resp, err := c.client.Im.Message.Reply(ctx, req)
-		if err != nil {
-			return "", fmt.Errorf("reply file message: %w", err)
+		var msgID string
+		err := c.withTokenRetry("SendFile/reply", func() (int, string, error) {
+			resp, err := c.client.Im.Message.Reply(ctx, req)
+			if err != nil {
+				return 0, "", err
+			}
+			if !resp.Success() {
+				return resp.Code, resp.Msg, nil
+			}
+			if resp.Data != nil && resp.Data.MessageId != nil {
+				msgID = *resp.Data.MessageId
+			}
+			return 0, "", nil
+		})
+		if err != nil && isReplyAnchorMissing(err) {
+			return "", errReplyAnchorMissing
 		}
-		if !resp.Success() {
-			return "", fmt.Errorf("reply file message: code=%d msg=%s", resp.Code, resp.Msg)
-		}
-		if resp.Data == nil || resp.Data.MessageId == nil {
-			return "", nil
-		}
-		return *resp.Data.MessageId, nil
+		return msgID, err
 	}
 
 	req := larkim.NewCreateMessageReqBuilder().
@@ -1082,17 +1096,23 @@ func (c *Channel) SendFile(ctx context.Context, chatID, replyToMsgID, filename s
 			Content(string(content)).
 			Build()).
 		Build()
-	resp, err := c.client.Im.Message.Create(ctx, req)
-	if err != nil {
+	var msgID string
+	if err := c.withTokenRetry("SendFile/create", func() (int, string, error) {
+		resp, err := c.client.Im.Message.Create(ctx, req)
+		if err != nil {
+			return 0, "", err
+		}
+		if !resp.Success() {
+			return resp.Code, resp.Msg, nil
+		}
+		if resp.Data != nil && resp.Data.MessageId != nil {
+			msgID = *resp.Data.MessageId
+		}
+		return 0, "", nil
+	}); err != nil {
 		return "", fmt.Errorf("send file message: %w", err)
 	}
-	if !resp.Success() {
-		return "", fmt.Errorf("send file message: code=%d msg=%s", resp.Code, resp.Msg)
-	}
-	if resp.Data == nil || resp.Data.MessageId == nil {
-		return "", nil
-	}
-	return *resp.Data.MessageId, nil
+	return msgID, nil
 }
 
 // this is best-effort enrichment, not a load-bearing call.

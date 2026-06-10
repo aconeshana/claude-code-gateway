@@ -201,6 +201,9 @@ func (w *summaryWorker) regenerate(ctx context.Context, job summaryJob) error {
 	// so we can extract it deterministically (the model is free to think out
 	// loud beforehand; we only keep what's between the tags).
 	prompt := buildRecapPrompt(job.SourceRef)
+	if prompt == "" {
+		return fmt.Errorf("transcript empty or unreadable: %s", job.SourceRef)
+	}
 	result, err := w.admin.query(ctx, prompt)
 	if err != nil {
 		return err

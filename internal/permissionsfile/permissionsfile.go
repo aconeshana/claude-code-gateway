@@ -96,8 +96,8 @@ func IsValidBehavior(b Behavior) bool {
 func SettingsPath(src Source, projectDir string) string {
 	switch src {
 	case SourceUser:
-		home := os.Getenv("HOME")
-		if home == "" {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
 			return ""
 		}
 		return filepath.Join(home, ".claude", "settings.json")

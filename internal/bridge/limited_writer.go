@@ -13,7 +13,7 @@ type limitedWriter struct {
 func (w *limitedWriter) Write(p []byte) (int, error) {
 	remaining := w.limit - w.buf.Len()
 	if remaining <= 0 {
-		return len(p), nil
+		return 0, nil
 	}
 	if len(p) > remaining {
 		p = p[:remaining]

@@ -99,7 +99,7 @@ func buildMemoryDetailCard(f claudefiles.MemoryFile, index int, projectDir strin
 	}
 
 	sections := []channel.Section{
-		{Markdown: fmt.Sprintf("**%s**\n`%s`", f.Label, f.Path)},
+		{Markdown: fmt.Sprintf("**%s**\n`%s`", f.Label, displayPath(f.Path))},
 		{Divider: true, Markdown: content},
 		{
 			Divider: true,

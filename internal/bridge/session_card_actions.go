@@ -83,9 +83,15 @@ func (b *Bridge) handleSessionCardAction(ctx context.Context, m channel.InboundM
 		}
 		info := sess.Info()
 		if info.Origin == session.OriginExternal && info.OwnerID == "" {
-			_ = b.mgr.ClaimExternal(sess.ID, m.UserID, m.ChatID, m.ChannelKind)
+			if err := b.mgr.ClaimExternal(sess.ID, m.UserID, m.ChatID, m.ChannelKind); err != nil {
+				b.replyOrText(ctx, m, "纳管失败: "+err.Error())
+				return true
+			}
 		}
-		_ = b.mgr.Archive(sess.ID)
+		if err := b.mgr.Archive(sess.ID); err != nil {
+			b.replyOrText(ctx, m, "归档失败: "+err.Error())
+			return true
+		}
 		b.saveStateIfPossible()
 		// Stay in the originating card: project view when working_dir is
 		// known (drill-in from /list), switch-card otherwise. Falls back
@@ -167,16 +173,18 @@ func (b *Bridge) handleSessionCardAction(ctx context.Context, m channel.InboundM
 		if id == "" {
 			return true
 		}
-		newSess, err := b.mgr.Reactivate(ctx, id)
+		sess, exists := b.resolveSessionByPayload(id)
+		if !exists {
+			b.replyOrText(ctx, m, "session 不存在")
+			return true
+		}
+		newSess, err := b.mgr.Reactivate(ctx, sess.ID)
 		if err != nil {
 			b.replyOrText(ctx, m, "恢复失败: "+err.Error())
 			return true
 		}
 		b.ensureSubscribed(ctx, newSess, m)
 		b.saveStateIfPossible()
-		// Bounce back to the project view so the user sees the row move
-		// out of archived. If we don't know the project, fall back to a
-		// short ack via Reply (still in-place).
 		dir, _ := m.Action.Values["working_dir"].(string)
 		if dir != "" {
 			returnTo, _ := m.Action.Values["return_to"].(string)
@@ -189,7 +197,15 @@ func (b *Bridge) handleSessionCardAction(ctx context.Context, m channel.InboundM
 		if id == "" {
 			return true
 		}
-		_ = b.mgr.RemoveArchived(id)
+		sess, exists := b.resolveSessionByPayload(id)
+		if !exists {
+			b.replyOrText(ctx, m, "session 不存在")
+			return true
+		}
+		if err := b.mgr.RemoveArchived(sess.ID); err != nil {
+			b.replyOrText(ctx, m, "删除失败: "+err.Error())
+			return true
+		}
 		b.saveStateIfPossible()
 		// Redraw the archived view (or fall back to top list when this was
 		// the last archived session in the project).
@@ -294,7 +310,7 @@ func (b *Bridge) buildProjectCard(userID, dir string, archivedOnly bool, returnT
 		if len(archived) == 0 {
 			return channel.Card{}, false
 		}
-		sections := buildArchivedSectionsWithDir(archived, dir)
+		sections := buildArchivedSectionsWithDir(archived, dir, returnTo)
 		// archived view goes back to the project view (same returnTo) so the
 		// outer loop is preserved.
 		sections = appendBackButton(sections, "show_project", map[string]string{"working_dir": dir, "return_to": returnTo})

@@ -127,8 +127,11 @@ func TestBuildMCPCard_HTTPVsStdio(t *testing.T) {
 	if !strings.Contains(full, "node x.js") {
 		t.Errorf("stdio server should show command + args concatenated")
 	}
-	if !strings.Contains(full, "http://example/mcp") {
-		t.Errorf("http server should show URL")
+	if !strings.Contains(full, "example") {
+		t.Errorf("http server should show redacted URL with host")
+	}
+	if strings.Contains(full, "http://example/mcp") {
+		t.Errorf("http server should not expose full URL path")
 	}
 }
 
@@ -198,7 +201,7 @@ func TestRedactCommand(t *testing.T) {
 		{"bash -c 'foo'", "bash …"},
 		{"/usr/local/bin/hook --arg x", "/usr/local/bin/hook …"},
 		{"FOO=bar node script.js", "node …"},
-		{"FOO=bar BAR=baz", "FOO=bar …"}, // unusual but don't infinite-peel
+		{"FOO=bar BAR=baz", "…"}, // all tokens are env assigns — hide everything
 		{"", ""},
 	}
 	for _, c := range cases {
