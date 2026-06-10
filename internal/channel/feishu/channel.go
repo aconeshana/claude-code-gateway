@@ -1125,13 +1125,28 @@ func (c *Channel) lookupCardMessageContext(ctx context.Context, msgID string) (t
 	if msgID == "" {
 		return
 	}
+	// Use a short bounded timeout so a slow/stale Lark response doesn't block
+	// the card-action callback past Lark's ~3s action timeout.
+	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
 	req := larkim.NewGetMessageReqBuilder().MessageId(msgID).Build()
-	resp, err := c.client.Im.Message.Get(ctx, req)
-	if err != nil {
+	var resp *larkim.GetMessageResp
+	if err := c.withTokenRetry("lookupCardMsgCtx", func() (int, string, error) {
+		var apiErr error
+		resp, apiErr = c.client.Im.Message.Get(lookupCtx, req)
+		if apiErr != nil {
+			return 0, "", apiErr
+		}
+		if !resp.Success() {
+			return resp.Code, resp.Msg, nil
+		}
+		return 0, "", nil
+	}); err != nil {
 		log.Printf("[channel/feishu] lookup card msg %s: %v", shortID(msgID), err)
 		return
 	}
-	if resp == nil || !resp.Success() || resp.Data == nil || len(resp.Data.Items) == 0 {
+	if resp == nil || resp.Data == nil || len(resp.Data.Items) == 0 {
 		return
 	}
 	msg := resp.Data.Items[0]
