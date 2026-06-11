@@ -36,7 +36,7 @@ case "${1:-}" in
     build)          do_build ;;
     start)          do_build; "$BINARY" start "${@:2}" ;;
     stop)           "$BINARY" stop ;;
-    restart)        "$BINARY" restart "${@:2}" ;;
+    restart)        do_build; "$BINARY" restart "${@:2}" ;;
     status)         "$BINARY" status ;;
     logs)           "$BINARY" logs "${@:2}" ;;
     *)              usage ;;

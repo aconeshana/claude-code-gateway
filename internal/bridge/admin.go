@@ -211,14 +211,10 @@ func (a *admin) getOrCreateSession(ctx context.Context) (*session.Session, error
 }
 
 // updateSummary asks the admin to summarize sessionID and writes the result
-// back via mgr.SetSummary. Uses the same prompt as the external-session
-// summary worker (buildSummaryPrompt) for consistency — we ignore the
-// in-memory `messages` slice and instead point admin at the on-disk jsonl
-// via jq so both code paths benefit from the same prompt-engineering work.
-//
-// userID is retained for future per-user policy hooks (none yet); messages
-// is unused but kept in the signature for ABI compatibility with the bridge
-// callsite, which still slices the recent buffer.
+// back via mgr.SetSummary. The conversation context is read from the on-disk
+// JSONL and embedded directly in the prompt — admin acts as a pure text LLM
+// with no tools needed. Both the background worker and this path use
+// buildRecapPrompt for consistent output.
 func (b *Bridge) updateSummary(sessionID, userID string, messages []string) {
 	if b.admin == nil {
 		b.mgr.ClearSummaryPending(sessionID)
@@ -231,29 +227,28 @@ func (b *Bridge) updateSummary(sessionID, userID string, messages []string) {
 	info := sess.Info()
 	jsonlPath := persist.SessionJSONLPath(info.WorkingDir, info.CLISessionID)
 	if jsonlPath == "" {
-		// CLI session id not yet known (very-new session). Skip — the next
-		// SUMMARY_INTERVAL trigger will catch it. Release the pending flag
-		// so the next ShouldUpdateSummary call can actually trigger.
 		b.mgr.ClearSummaryPending(sessionID)
 		return
 	}
-	prompt := buildSummaryPrompt(jsonlPath)
+	prompt := buildRecapPrompt(jsonlPath)
+	if prompt == "" {
+		b.mgr.ClearSummaryPending(sessionID)
+		return
+	}
 	reply, err := b.admin.query(context.Background(), prompt)
 	if err != nil {
 		log.Printf("[bridge/admin] update summary failed for %s: %v", shortID(sessionID), err)
-		// Failure must release the pending flag — without this a single
-		// transient error (Bedrock blip, admin queue overflow) permanently
-		// prevents future summary updates for this session.
 		b.mgr.ClearSummaryPending(sessionID)
 		return
 	}
-	summary := cleanAdminSummary(reply)
+	summary := cleanSummaryOutput(reply)
 	if summary == "" || summary == "_skip_meta_" {
-		// Skip-meta is a deliberate no-op (admin classified the session as
-		// meta/empty); still release pending so future turns can re-evaluate.
 		log.Printf("[bridge/admin] update summary skipped for %s (empty or _skip_meta_)", shortID(sessionID))
 		b.mgr.ClearSummaryPending(sessionID)
 		return
+	}
+	if r := []rune(summary); len(r) > 150 {
+		summary = string(r[:150]) + "…"
 	}
 	_ = b.mgr.SetSummary(sessionID, summary)
 	b.saveStateIfPossible()

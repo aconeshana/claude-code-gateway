@@ -21,7 +21,7 @@ Claude Code will clone, build, write the dotenv, register the launch agent / sys
 
 ### Option B — Manual
 
-Requirements: `go ≥ 1.22`, `claude` CLI, `jq` (recommended), `git`.
+Requirements: `go ≥ 1.22`, `claude` CLI, `git`.
 
 ```bash
 git clone https://github.com/aconeshana/claude-code-gateway.git
@@ -31,7 +31,7 @@ go build -o gateway .
 # Minimal config — same directory as the binary
 cat > .env <<'EOF'
 GATEWAY_DEFAULT_CWD=~          # fallback dir for main-chat plain text
-ADMIN_MODEL=claude-sonnet-4-6  # for summaries / fuzzy matching
+ADMIN_MODEL=claude-haiku-4-5   # for summaries / fuzzy matching
 # Enable Feishu (optional)
 # FEISHU_APP_ID=cli_xxx
 # FEISHU_APP_SECRET=xxx
@@ -94,7 +94,7 @@ Set via env vars, `.env` next to the binary, or hot-edit via the `/config` comma
 | `GATEWAY_LISTEN_ADDR` | `:8080` | WebSocket listen address |
 | `GATEWAY_MAX_SESSIONS` | `10` | max concurrent CLI processes |
 | `SUMMARY_INTERVAL` | `5` | regenerate summary every N user messages (0 = off) |
-| `ADMIN_MODEL` | `claude-haiku-4-5` | model used by the summary worker (sonnet recommended in prod) |
+| `ADMIN_MODEL` | `claude-haiku-4-5` | model used by the summary worker and `/recap` |
 | `GATEWAY_SHARE_EXTERNAL_SESSIONS` | `false` | surface sessions discovered from terminal/SDK use |
 | `GATEWAY_DISCOVERY_WINDOW_DAYS` | `7` | scan window for external session jsonl files |
 | `GATEWAY_DISCOVERY_RESCAN_INTERVAL` | `5m` | how often to rescan disk |

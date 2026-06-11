@@ -49,9 +49,10 @@ type PersistentSession struct {
 	LatestUserMessage string `json:"latest_user_message,omitempty"`
 	Origin            string `json:"origin,omitempty"`
 	ChannelKind       string `json:"channel_kind,omitempty"`
-	ThreadID          string `json:"thread_id,omitempty"`
-	RootMessageID     string `json:"root_message_id,omitempty"`
-	WorkingDir        string `json:"working_dir"`
+	ThreadID          string   `json:"thread_id,omitempty"`
+	RootMessageID     string   `json:"root_message_id,omitempty"`
+	ExtraAddDirs      []string `json:"extra_add_dirs,omitempty"`
+	WorkingDir        string   `json:"working_dir"`
 	ChatID            string `json:"chat_id"`
 	Status            string `json:"status,omitempty"`
 	JSONLPath         string `json:"jsonl_path,omitempty"`
@@ -326,6 +327,7 @@ func (s *JSONStore) Load(mgr *session.Manager) error {
 				ChannelKind:       defaultChannelKind(ps.ChannelKind),
 				ThreadID:          ps.ThreadID,
 				RootMessageID:     ps.RootMessageID,
+				ExtraAddDirs:      ps.ExtraAddDirs,
 			}
 			if status == string(session.StatusArchived) {
 				_, _ = mgr.ImportArchivedSession(opts)
@@ -444,6 +446,7 @@ func buildCurrentState(mgr *session.Manager) *PersistentState {
 				ChannelKind:       info.ChannelKind,
 				ThreadID:          info.ThreadID,
 				RootMessageID:     info.RootMessageID,
+				ExtraAddDirs:      info.ExtraAddDirs,
 				WorkingDir:        info.WorkingDir,
 				ChatID:            info.ChatID,
 				Status:            info.Status,

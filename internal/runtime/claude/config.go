@@ -56,3 +56,37 @@ func (c Config) WithModel(model string) runtime.Config {
 	c.Model = model
 	return c
 }
+
+// WithEffort returns a copy of cfg with Effort set to level. Used by the
+// session manager when handling /effort switches. Empty string clears the
+// flag (claude-code resolves an absent --effort against settings.json
+// effortLevel, which itself falls back to a model-default level).
+func (c Config) WithEffort(level string) runtime.Config {
+	c.Effort = level
+	return c
+}
+
+// WithAddDir returns a copy of cfg with dir appended to AddDirs (no-op when
+// already present). Used by the session manager when handling /add-dir.
+func (c Config) WithAddDir(dir string) runtime.Config {
+	for _, d := range c.AddDirs {
+		if d == dir {
+			return c
+		}
+	}
+	newDirs := make([]string, len(c.AddDirs)+1)
+	copy(newDirs, c.AddDirs)
+	newDirs[len(c.AddDirs)] = dir
+	c.AddDirs = newDirs
+	return c
+}
+
+// WithPermissionMode returns a copy of cfg with PermissionMode set to mode.
+// Used by the session manager when handling /permissions switches.
+// Caller is responsible for passing one of the canonical PermissionAuto /
+// PermissionForward / PermissionDefault constants — bridge layer normalizes
+// user-typed input via bridge.NormalizePermissionMode before reaching here.
+func (c Config) WithPermissionMode(mode string) runtime.Config {
+	c.PermissionMode = mode
+	return c
+}

@@ -1,8 +1,12 @@
 package feishu
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
+	"sort"
+	"strings"
 
 	"github.com/anthropics/claude-code-gateway/internal/channel"
 )
@@ -61,8 +65,20 @@ func renderCard(c channel.Card) string {
 		},
 		"elements": elements,
 	}
-	data, _ := json.Marshal(card)
-	return string(data)
+	// Use a custom encoder with SetEscapeHTML(false) so & in form-submit
+	// button names (querystring separators) survives as a literal byte
+	// rather than &. Lark accepts both, but the literal form is
+	// readable in logs and avoids decode complications downstream.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(card)
+	// Encoder.Encode appends a trailing newline; strip it to match prior behavior.
+	out := buf.Bytes()
+	if n := len(out); n > 0 && out[n-1] == '\n' {
+		out = out[:n-1]
+	}
+	return string(out)
 }
 
 func toneToTemplate(t channel.Tone) string {
@@ -154,13 +170,13 @@ func formElement(f channel.Form) map[string]interface{} {
 	if f.Submit.Label != "" {
 		submitBtn = buttonElement(f.Submit)
 		submitBtn["form_action_type"] = "submit"
-		actionName := f.Submit.Action["action"]
-		key := f.Submit.Action["key"]
-		if actionName != "" {
-			submitBtn["name"] = actionName + ":" + key
-		} else {
-			submitBtn["name"] = f.FormID + "_submit"
-		}
+		// Lark form_submit swallows button.value, so all button-level
+		// payload must be smuggled through button.name. We encode the
+		// entire Action map as a querystring (action=X&behavior=allow&
+		// source=local&...) so callers can pass arbitrary keys without
+		// hitting the historical 2-field limit ("<action>:<key>") that
+		// dropped extras silently. Decode side: channel.go's fallback.
+		submitBtn["name"] = encodeSubmitName(f.Submit.Action, f.FormID)
 	}
 
 	if len(f.LeadingButtons) > 0 {
@@ -273,4 +289,40 @@ func trailingButtonRow(md string, b channel.Button) map[string]interface{} {
 		columnWith("auto", 0, []interface{}{buttonElement(b)}),
 	}
 	return columnSet(cols)
+}
+
+// encodeSubmitName packs an action map into a string suitable for the
+// form-submit button's `name` field. Lark form_submit drops button.value
+// entirely, so this is the only channel for button-level metadata —
+// without it, form callbacks can only carry the submit handler's
+// identity ("which button") and form_value ("what the user typed"),
+// losing per-form context (e.g. which behavior/source the wizard had
+// preselected before reaching the input step).
+//
+// Format:
+//   - querystring: key1=value1&key2=value2 (keys sorted for determinism)
+//   - empty action map → falls back to "<formID>_submit" sentinel so the
+//     callback still has something to match in dispatcher logs
+//
+// The "=" character is the format discriminator: channel.go's decode
+// uses its presence to distinguish this form from the legacy
+// "<action>:<key>" two-field encoding (still emitted by older callers
+// not yet migrated).
+func encodeSubmitName(action map[string]string, formID string) string {
+	if len(action) == 0 {
+		if formID == "" {
+			return "submit"
+		}
+		return formID + "_submit"
+	}
+	keys := make([]string, 0, len(action))
+	for k := range action {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var parts []string
+	for _, k := range keys {
+		parts = append(parts, url.QueryEscape(k)+"="+url.QueryEscape(action[k]))
+	}
+	return strings.Join(parts, "&")
 }

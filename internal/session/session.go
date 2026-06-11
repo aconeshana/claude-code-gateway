@@ -131,6 +131,10 @@ type Session struct {
 	Label       string
 	Summary     string
 	CustomTitle string // /rename-style name; takes display precedence over Summary
+	// ExtraAddDirs are directories appended via /add-dir at runtime. They are
+	// persisted and carried forward to every respawn / reactivation so users
+	// don't need to re-add them after an idle→active transition.
+	ExtraAddDirs []string
 	// LatestUserMessage is the most recent user-sent text (truncated). Used
 	// as a decision aid in the list UI when Summary is empty (short session)
 	// — shows the user what they actually said last, regardless of Origin.
@@ -225,6 +229,7 @@ type SessionInfo struct {
 	Summary           string `json:"summary,omitempty"`
 	CustomTitle       string `json:"custom_title,omitempty"`
 	LatestUserMessage string `json:"latest_user_message,omitempty"`
+	ExtraAddDirs      []string `json:"extra_add_dirs,omitempty"`
 	Origin            string `json:"origin,omitempty"`
 	ChatID            string `json:"chat_id,omitempty"`
 	ChannelKind       string `json:"channel_kind,omitempty"`
@@ -290,6 +295,7 @@ func (s *Session) Info() SessionInfo {
 		Summary:           s.Summary,
 		CustomTitle:       s.CustomTitle,
 		LatestUserMessage: s.LatestUserMessage,
+		ExtraAddDirs:      s.ExtraAddDirs,
 		Origin:            s.Origin,
 		ChatID:            s.ChatID,
 		ChannelKind:       s.ChannelKind,
@@ -675,10 +681,72 @@ func (s *Session) BroadcastEvent(event map[string]interface{}) {
 }
 
 func (s *Session) SwitchModel(newModel string) error {
+	return s.respawnWithConfig(
+		fmt.Sprintf("switched model to %s", newModel),
+		func(cfg runtime.Config) runtime.Config { return applyModelOverride(cfg, newModel) },
+	)
+}
+
+// SwitchEffort changes the reasoning effort level for the current session
+// without losing conversation history. Empty level clears the override and
+// lets claude-code resolve --effort against settings.json's effortLevel.
+func (s *Session) SwitchEffort(newEffort string) error {
+	return s.respawnWithConfig(
+		fmt.Sprintf("switched effort to %s", labelEffort(newEffort)),
+		func(cfg runtime.Config) runtime.Config { return applyEffortOverride(cfg, newEffort) },
+	)
+}
+
+// AddDir respawns the CLI with dir added to its allowed directories.
+// ExtraAddDirs must be updated by the caller (Manager.AddSessionDir) before
+// calling AddDir; this method only handles the CLI restart.
+func (s *Session) AddDir(dir string) error {
+	return s.respawnWithConfig(
+		fmt.Sprintf("added dir %s", dir),
+		func(cfg runtime.Config) runtime.Config { return applyAddDirOverride(cfg, dir) },
+	)
+}
+
+// RestartForSettings respawns the CLI process with the SAME runtime
+// config so it re-reads settings.json (permissions, hooks, env, ...). The
+// CLI session id and conversation history are preserved via --resume.
+//
+// Use this after writing to settings.json via permissionsfile.Add /
+// Remove. The caller is responsible for deciding whether respawn is safe
+// at this moment (bridge.decideRespawn is the canonical policy);
+// RestartForSettings itself will happily kill an in-flight turn if asked.
+func (s *Session) RestartForSettings(reason string) error {
+	label := "restarted to reload settings"
+	if reason != "" {
+		label = "restarted to reload settings (" + reason + ")"
+	}
+	return s.respawnWithConfig(label, func(cfg runtime.Config) runtime.Config { return cfg })
+}
+
+// respawnWithConfig graceful-stops the current CLI process, mutates the
+// runtime config, and respawns with --resume <cli_session_id>. The CLI
+// session id and conversation history are preserved. Used by Switch*
+// methods to apply spawn-time-only config changes to an active session.
+//
+// label is logged on success (e.g. "switched model to sonnet"). When the
+// runtime config does not implement the override interface the mutator is
+// expected to log a WARNING and return cfg unchanged — the respawn still
+// happens but with the same config (effectively a process recycle).
+type configMutator func(cfg runtime.Config) runtime.Config
+
+func (s *Session) respawnWithConfig(label string, mutate configMutator) error {
 	s.mu.Lock()
 	if s.state == StateStopped || s.state == StateError {
 		s.mu.Unlock()
 		return fmt.Errorf("session %s is %s", s.ID, s.state)
+	}
+	if s.switching {
+		// Another respawn is already in flight for this session. Refuse
+		// rather than racing on s.process — concurrent SwitchModel +
+		// SwitchEffort + RestartForSettings calls would otherwise
+		// interleave their Spawn/Done() handshakes and leak processes.
+		s.mu.Unlock()
+		return fmt.Errorf("session %s is already respawning", s.ID)
 	}
 	cliSessionID := s.CLISessionID
 	if cliSessionID == "" {
@@ -696,7 +764,7 @@ func (s *Session) SwitchModel(newModel string) error {
 
 	newReq := s.spawnReq
 	newReq.ResumeID = cliSessionID
-	newReq.Config = applyModelOverride(newReq.Config, newModel)
+	newReq.Config = mutate(newReq.Config)
 
 	s.cancelKeep()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -724,7 +792,7 @@ func (s *Session) SwitchModel(newModel string) error {
 
 	go s.keepAliveLoop(ctx, s.keepAliveInt)
 
-	log.Printf("[session %s] switched model to %s (cli_session=%s)", s.ID, newModel, cliSessionID)
+	log.Printf("[session %s] %s (cli_session=%s)", s.ID, label, cliSessionID)
 	return nil
 }
 
@@ -742,6 +810,48 @@ func applyModelOverride(cfg runtime.Config, newModel string) runtime.Config {
 		return m.WithModel(newModel)
 	}
 	log.Printf("[session] WARNING: runtime config %T does not support WithModel(); /model switch is a no-op", cfg)
+	return cfg
+}
+
+// effortOverrider mirrors modelOverrider for /effort switches.
+type effortOverrider interface {
+	WithEffort(level string) runtime.Config
+}
+
+func applyEffortOverride(cfg runtime.Config, newEffort string) runtime.Config {
+	if cfg == nil {
+		return cfg
+	}
+	if m, ok := cfg.(effortOverrider); ok {
+		return m.WithEffort(newEffort)
+	}
+	log.Printf("[session] WARNING: runtime config %T does not support WithEffort(); /effort switch is a no-op", cfg)
+	return cfg
+}
+
+// labelEffort returns a human-friendly name for log/UX text. Empty (the
+// "let settings.json or model-default decide" sentinel) renders as "auto"
+// so users don't see a confusing blank value in success messages.
+func labelEffort(level string) string {
+	if level == "" {
+		return "auto"
+	}
+	return level
+}
+
+// dirAdder mirrors modelOverrider for /add-dir respawns.
+type dirAdder interface {
+	WithAddDir(dir string) runtime.Config
+}
+
+func applyAddDirOverride(cfg runtime.Config, dir string) runtime.Config {
+	if cfg == nil {
+		return cfg
+	}
+	if a, ok := cfg.(dirAdder); ok {
+		return a.WithAddDir(dir)
+	}
+	log.Printf("[session] WARNING: runtime config %T does not support WithAddDir(); /add-dir is a no-op", cfg)
 	return cfg
 }
 

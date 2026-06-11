@@ -25,7 +25,6 @@ Run these in parallel and report any missing items:
 command -v go && go version          # need >= 1.22
 command -v claude && claude --version # claude CLI must exist
 command -v git
-command -v jq                         # recommended but not required
 uname -s                              # detect platform: Darwin or Linux
 ```
 
@@ -36,13 +35,7 @@ uname -s                              # detect platform: Darwin or Linux
 **If `claude` is missing**: stop and tell the user:
 > 需要先安装 Claude Code CLI: https://docs.claude.com/en/docs/claude-code
 
-**If `jq` is missing**: continue, but tell the user — without `jq` the summary worker will be 3x slower:
-- macOS: `brew install jq`
-- Linux: `apt install jq` / `dnf install jq`
-
----
-
-## 2. Clone and build
+**If `claude` is missing**: stop and tell the user:
 
 Pick a stable install directory (don't put it in a temp dir):
 
@@ -80,7 +73,7 @@ Then write `$INSTALL_DIR/.env`:
 cat > "$INSTALL_DIR/.env" <<EOF
 GATEWAY_DEFAULT_CWD=$DEFAULT_CWD
 GATEWAY_LISTEN_ADDR=:8080
-ADMIN_MODEL=claude-sonnet-4-6
+ADMIN_MODEL=claude-haiku-4-5
 SUMMARY_INTERVAL=5
 # Feishu (set both to enable)
 # FEISHU_APP_ID=

@@ -21,7 +21,7 @@ Claude Code 会自动完成 clone、编译、写 .env、注册 launchd / systemd
 
 ### 方式 B —— 手动
 
-依赖：`go ≥ 1.22`、`claude` CLI、`jq`（推荐）、`git`。
+依赖：`go ≥ 1.22`、`claude` CLI、`git`。
 
 ```bash
 git clone https://github.com/aconeshana/claude-code-gateway.git
@@ -31,7 +31,7 @@ go build -o gateway .
 # 最小配置 —— 跟 gateway 二进制同目录
 cat > .env <<'EOF'
 GATEWAY_DEFAULT_CWD=~          # 主聊天 plain text 兜底目录
-ADMIN_MODEL=claude-sonnet-4-6  # 摘要 / 语义匹配用的模型
+ADMIN_MODEL=claude-haiku-4-5   # 摘要 / 语义匹配用的模型
 # 启用飞书(可选)
 # FEISHU_APP_ID=cli_xxx
 # FEISHU_APP_SECRET=xxx
@@ -94,7 +94,7 @@ WebSocket / 飞书客户端                       ┌─────────
 | `GATEWAY_LISTEN_ADDR` | `:8080` | WebSocket 监听地址 |
 | `GATEWAY_MAX_SESSIONS` | `10` | 最大并发 CLI 进程数 |
 | `SUMMARY_INTERVAL` | `5` | 每 N 条用户消息触发一次摘要重生成（0 = 关） |
-| `ADMIN_MODEL` | `claude-haiku-4-5` | 摘要 worker 用的小模型（生产推荐 sonnet） |
+| `ADMIN_MODEL` | `claude-haiku-4-5` | 摘要 worker 和 `/recap` 使用的模型 |
 | `GATEWAY_SHARE_EXTERNAL_SESSIONS` | `false` | 是否在 IM 里展示终端/SDK 创建的外部会话 |
 | `GATEWAY_DISCOVERY_WINDOW_DAYS` | `7` | 外部会话扫描时间窗口（0 = 全量） |
 | `GATEWAY_DISCOVERY_RESCAN_INTERVAL` | `5m` | 重新扫描间隔 |

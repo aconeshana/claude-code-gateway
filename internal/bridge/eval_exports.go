@@ -22,13 +22,16 @@ func NewAdminForEval(mgr *session.Manager, workingDir, model string) *AdminForEv
 
 func (a *AdminForEval) Destroy() { a.inner.destroy() }
 
-// RunSummaryPromptForEval runs the exact prompt used by summaryWorker
+// RunSummaryPromptForEval runs the recap prompt used by summaryWorker
 // against sourceRef and returns the cleaned summary. No state is persisted.
 func RunSummaryPromptForEval(ctx context.Context, a *AdminForEval, sourceRef string) (string, error) {
-	prompt := buildSummaryPrompt(sourceRef)
+	prompt := buildRecapPrompt(sourceRef)
+	if prompt == "" {
+		return "_skip_meta_", nil
+	}
 	raw, err := a.inner.query(ctx, prompt)
 	if err != nil {
 		return raw, err
 	}
-	return cleanAdminSummary(raw), nil
+	return cleanSummaryOutput(raw), nil
 }
